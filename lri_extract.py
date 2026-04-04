@@ -38,6 +38,7 @@ CAMERA_ID_NAMES = {
     10: 'C1', 11: 'C2', 12: 'C3', 13: 'C4', 14: 'C5', 15: 'C6',
 }
 
+FORMAT_BAYER_JPEG   = 0
 FORMAT_PACKED_10BPP = 7
 FORMAT_PACKED_12BPP = 8
 FORMAT_PACKED_14BPP = 9
@@ -122,6 +123,76 @@ def unpack_10bpp(data: bytes, abs_offset: int, width: int, height: int, stride: 
     p3 = (g[:, :, 3] >> 6) |  (g[:, :, 4]         << 2)
 
     return np.stack([p0, p1, p2, p3], axis=2).reshape(height, width)
+
+
+# ── BAYER_JPEG decoder ───────────────────────────────────────────────────────
+
+def decode_bayer_jpeg(data: bytes, abs_offset: int, width: int, height: int,
+                      bayer_pattern: int) -> np.ndarray:
+    """
+    Decode a BAYER_JPEG block → uint16 Bayer array (height, width).
+
+    Structure at abs_offset (from lri-rs/block.rs):
+      bytes  0– 3: unknown
+      bytes  4– 7: format  (u32 LE)  0=colour/4 JPEGs, 1=mono/1 JPEG
+      bytes  8–11: jpeg0_len (u32 LE)
+      bytes 12–15: jpeg1_len (u32 LE)
+      bytes 16–19: jpeg2_len (u32 LE)
+      bytes 20–23: jpeg3_len (u32 LE)
+      [1576 bytes total header]
+      jpeg0 data  (half-res, one Bayer channel)
+      jpeg1 data
+      jpeg2 data
+      jpeg3 data
+
+    Each JPEG is (height//2, width//2) — one of the 4 Bayer sub-channels.
+    We decode all 4 and interleave them into the full (height, width) Bayer grid
+    using the CFA pattern to assign R/G1/G2/B positions.
+    """
+    import io
+    hdr = data[abs_offset : abs_offset + 1576]
+    colour_fmt  = struct.unpack_from('<I', hdr, 4)[0]   # 0=colour, 1=mono
+    jpeg_lens   = struct.unpack_from('<4I', hdr, 8)     # lengths of 4 JPEGs
+
+    pos = abs_offset + 1576
+    jpegs = []
+    n_jpegs = 1 if colour_fmt == 1 else 4
+    for i in range(n_jpegs):
+        jpegs.append(data[pos : pos + jpeg_lens[i]])
+        pos += jpeg_lens[i]
+
+    # Decode each JPEG → numpy (h2, w2) grayscale
+    # Each JPEG is a half-res single-channel image for one Bayer position
+    channels = []
+    for jpg in jpegs:
+        img = PILImage.open(io.BytesIO(jpg)).convert('L')
+        arr = np.array(img, dtype=np.uint16)
+        # JPEGs are 8-bit; scale to 10-bit range to match PACKED_10BPP files
+        arr = (arr.astype(np.uint32) * 4).clip(0, 1023).astype(np.uint16)
+        channels.append(arr)
+
+    H2, W2 = channels[0].shape
+
+    if colour_fmt == 1:
+        # Mono: single full-res JPEG (H×W) — return directly as flat Bayer.
+        # Debayer will produce a grey image; that's correct for a mono sensor.
+        return channels[0]
+
+    # Colour: 4 half-res JPEGs → interleave into full-res Bayer grid (H2*2, W2*2)
+    # JPEG order from lri-rs: jpeg0=R, jpeg1=G1, jpeg2=G2, jpeg3=B.
+    # Bayer pattern (from sensor_bayer_red_override) tells us the CFA layout.
+    # Pattern: 0=RGGB, 1=GRBG, 2=GBRG, 3=BGGR
+    bayer_out = np.zeros((H2 * 2, W2 * 2), dtype=np.uint16)
+    r_row, r_col = _RGGB_R_POS.get(bayer_pattern, (0, 0))
+    b_row, b_col = 1 - r_row, 1 - r_col
+    g1_row, g1_col = r_row,  b_col
+    g2_row, g2_col = b_row,  r_col
+
+    bayer_out[r_row::2,  r_col::2]  = channels[0]   # R
+    bayer_out[g1_row::2, g1_col::2] = channels[1]   # G1
+    bayer_out[g2_row::2, g2_col::2] = channels[2]   # G2
+    bayer_out[b_row::2,  b_col::2]  = channels[3]   # B
+    return bayer_out
 
 
 # ── Bayer debayering ──────────────────────────────────────────────────────────
@@ -297,16 +368,22 @@ def extract_modules(
                     bx  = bov.get_int64(1); by = bov.get_int64(2)
                     bayer_pattern = int((bx + 2) % 2) | (int((by + 2) % 2) << 1)
 
-                if cam_id not in modules and fmt_int in (FORMAT_PACKED_10BPP,):
-                    modules[cam_id] = {
-                        'name':          CAMERA_ID_NAMES.get(cam_id, f'UNK{cam_id}'),
-                        'width':         int(width),
-                        'height':        int(height),
-                        'stride':        int(stride),
-                        'abs_data':      int(offset + data_off),
-                        'format':        fmt_int,
-                        'bayer_pattern': bayer_pattern,
-                    }
+                if fmt_int in (FORMAT_PACKED_10BPP, FORMAT_BAYER_JPEG):
+                    # For BAYER_JPEG: keep only the first exposure per camera
+                    # (lowest data_off = exposure index 0 = primary/shortest exposure)
+                    abs_data = int(offset + data_off)
+                    if cam_id not in modules or (
+                        fmt_int == FORMAT_BAYER_JPEG and abs_data < modules[cam_id]['abs_data']
+                    ):
+                        modules[cam_id] = {
+                            'name':          CAMERA_ID_NAMES.get(cam_id, f'UNK{cam_id}'),
+                            'width':         int(width),
+                            'height':        int(height),
+                            'stride':        int(stride),
+                            'abs_data':      abs_data,
+                            'format':        fmt_int,
+                            'bayer_pattern': bayer_pattern,
+                        }
         offset += block_len
 
     written = []
@@ -315,10 +392,14 @@ def extract_modules(
         name = m['name']
         W, H = m['width'], m['height']
 
-        print(f"  Extracting {name} ({W}×{H}) ...", end=' ', flush=True)
+        print(f"  Extracting {name} ({W}×{H}) fmt={m['format']} ...", end=' ', flush=True)
 
-        # Unpack 10-bit bayer data
-        bayer = unpack_10bpp(data, m['abs_data'], W, H, m['stride'])
+        # Decode raw Bayer data — format-dependent
+        if m['format'] == FORMAT_BAYER_JPEG:
+            bayer = decode_bayer_jpeg(data, m['abs_data'], W, H,
+                                      m['bayer_pattern'] if m['bayer_pattern'] >= 0 else 0)
+        else:
+            bayer = unpack_10bpp(data, m['abs_data'], W, H, m['stride'])
 
         if raw_bayer:
             # Save as 16-bit grayscale (no demosaic)
