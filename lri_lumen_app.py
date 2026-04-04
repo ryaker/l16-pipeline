@@ -129,9 +129,10 @@ def find_image_sets(folder: str):
 # ── Pipeline worker (LRI → processed image set) ───────────────────────────────
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_EXTRACT_SCRIPT   = os.path.join(_SCRIPT_DIR, 'lri_extract.py')
-_CAL_SCRIPT       = os.path.join(_SCRIPT_DIR, 'lri_calibration.py')
-_DEPTH_PRO_SCRIPT = os.path.join(_SCRIPT_DIR, 'ml-depth-pro', 'src', 'depth_pro', 'cli', 'run.py')
+_EXTRACT_SCRIPT    = os.path.join(_SCRIPT_DIR, 'lri_extract.py')
+_CAL_SCRIPT        = os.path.join(_SCRIPT_DIR, 'lri_calibration.py')
+_FUSE_IMAGE_SCRIPT = os.path.join(_SCRIPT_DIR, 'lri_fuse_image.py')
+_DEPTH_PRO_SCRIPT  = os.path.join(_SCRIPT_DIR, 'ml-depth-pro', 'src', 'depth_pro', 'cli', 'run.py')
 
 CAMERAS_PRIORITY = ['A1','A2','A3','A4','A5','B1','B2','B3','B4','B5','C1','C2','C3','C4','C5','C6']
 
@@ -246,13 +247,45 @@ class PipelineWorker(QRunnable):
         cv2.imwrite(fused_path, depth16)
         self.signals.progress.emit('Depth convert complete')
 
+    def _stage_calibration(self):
+        cal_path = os.path.join(self._cache, 'calibration.json')
+        if os.path.isfile(cal_path):
+            self.signals.progress.emit('Calibration: already done, skipping')
+            return
+        self.signals.progress.emit('Extracting factory calibration...')
+        self._run([sys.executable, _CAL_SCRIPT,
+                   self._lri_path, self._cache, '--json-only'], 'Calibration')
+        self.signals.progress.emit('Calibration complete')
+
+    def _stage_fuse_image(self):
+        fused_path = os.path.join(self._cache, 'fused_image_16bit.png')
+        if os.path.isfile(fused_path):
+            self.signals.progress.emit('Image fusion: already done, skipping')
+            return
+        cal_path   = os.path.join(self._cache, 'calibration.json')
+        frames_dir = os.path.join(self._cache, 'frames')
+        if not os.path.isfile(cal_path):
+            self.signals.progress.emit('Image fusion: no calibration, skipping')
+            return
+        # Require A1 to be present (fusion needs a reference frame)
+        if not os.path.isfile(os.path.join(frames_dir, 'A1.png')):
+            self.signals.progress.emit('Image fusion: no A1 frame, skipping (single-group LRI)')
+            return
+        self.signals.progress.emit('Fusing 10-camera images (RAFT + LightGlue)… this takes ~2–5 min')
+        self._run([sys.executable, _FUSE_IMAGE_SCRIPT,
+                   frames_dir, cal_path,
+                   '--output', fused_path], 'Image fusion')
+        self.signals.progress.emit('Image fusion complete')
+
     # ── main ──────────────────────────────────────────────────────────────────
 
     def run(self):
         try:
             self._stage_extract()
+            self._stage_calibration()
             self._stage_depth_pro()
             self._stage_convert_depth()
+            self._stage_fuse_image()
             self.signals.finished.emit(self._cache)
         except Exception as e:
             self.signals.error.emit(str(e))
@@ -670,13 +703,14 @@ class LumenWindow(QMainWindow):
         self.resize(1400, 900)
         self.setStyleSheet(DARK_STYLE)
 
-        self._img_rgb   = None
-        self._depth     = None
-        self._focus_mm  = 3000.0
-        self._bokeh_preview = None       # bokeh at 0.25 scale — reused by tone sliders
+        self._img_rgb        = None   # uint8 RGB for display (8-bit, gamma-corrected)
+        self._img_linear_16  = None   # float32 RGB [0..65535] linear light (pre-gamma) for DNG export
+        self._depth          = None
+        self._focus_mm       = 3000.0
+        self._bokeh_preview  = None       # bokeh at 0.25 scale — reused by tone sliders
         self._current_result = None
-        self._export_fmt_pending = None  # set when export needs a full-res render first
-        self._export_stem = 'L16_lumen'  # updated when an image is loaded
+        self._export_fmt_pending = None   # set when export needs a full-res render first
+        self._export_stem    = 'L16_lumen'  # updated when an image is loaded
         self._pool = QThreadPool.globalInstance()
         self._render_pending = False
 
@@ -869,11 +903,31 @@ class LumenWindow(QMainWindow):
             # data['img'] and data['depth'] hold explicit file paths
             img_path   = data['img']
             depth_path = data['depth']
+            img16_path = data.get('img16')   # 16-bit linear fused image (optional)
             import cv2 as _cv2
-            img_bgr = _cv2.imread(img_path)
-            if img_bgr is None:
-                raise FileNotFoundError(f'Cannot load image: {img_path}')
-            img_rgb = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2RGB).astype(np.float32)
+
+            # ── Load 16-bit linear image for DNG export ───────────────────────
+            if img16_path and os.path.isfile(img16_path):
+                img16_bgr = _cv2.imread(img16_path, _cv2.IMREAD_UNCHANGED)
+                if img16_bgr is not None:
+                    self._img_linear_16 = _cv2.cvtColor(
+                        img16_bgr, _cv2.COLOR_BGR2RGB).astype(np.float32)
+                else:
+                    self._img_linear_16 = None
+            else:
+                self._img_linear_16 = None
+
+            # ── Load display image (8-bit gamma-corrected) ────────────────────
+            # If we already loaded the 16-bit image, derive display from it
+            if self._img_linear_16 is not None:
+                # Scale [0..65535] → [0..255] then apply gamma 2.2
+                img_rgb = self._img_linear_16 / 257.0   # → [0..255] float
+            else:
+                img_bgr = _cv2.imread(img_path)
+                if img_bgr is None:
+                    raise FileNotFoundError(f'Cannot load image: {img_path}')
+                img_rgb = _cv2.cvtColor(img_bgr, _cv2.COLOR_BGR2RGB).astype(np.float32)
+
             # Grey-world AWB + gamma 2.2 so linear raw looks correct on display
             means = img_rgb.mean(axis=(0, 1))
             g = means[1]
@@ -938,7 +992,7 @@ class LumenWindow(QMainWindow):
         cache = lri_cache_dir(lri_path)
         name  = os.path.basename(lri_path)
 
-        # Check if already fully processed
+        # Check if already fully processed (depth map is the last required step)
         fused = os.path.join(cache, 'fused_10cams_median_depth.png')
         if os.path.isfile(fused) and first_frame(os.path.join(cache, 'frames')) is not None:
             self._status(f'Loading cached: {name}')
@@ -975,12 +1029,18 @@ class LumenWindow(QMainWindow):
         if ref is None:
             QMessageBox.critical(self, 'Load error', f'No frames found in {frames_dir}')
             return
+
+        # Prefer the 10-camera fused 16-bit image; fall back to single reference frame
+        fused_16bit = os.path.join(cache_dir, 'fused_image_16bit.png')
+        img_path = fused_16bit if os.path.isfile(fused_16bit) else os.path.join(frames_dir, f'{ref}.png')
+
         data = {
-            'type':  'processed',
-            'name':  name,
-            'path':  cache_dir,
-            'img':   os.path.join(frames_dir, f'{ref}.png'),
-            'depth': os.path.join(cache_dir, 'fused_10cams_median_depth.png'),
+            'type':   'processed',
+            'name':   name,
+            'path':   cache_dir,
+            'img':    img_path,
+            'img16':  fused_16bit if os.path.isfile(fused_16bit) else None,
+            'depth':  os.path.join(cache_dir, 'fused_10cams_median_depth.png'),
         }
         self._load_image_set(data)
 
@@ -1181,7 +1241,9 @@ class LumenWindow(QMainWindow):
             QApplication.processEvents()
 
             if fmt == 'dng':
-                export_dng(img_rgb, path,
+                # Use 16-bit linear data when available; fall back to display image
+                dng_src = self._img_linear_16 if self._img_linear_16 is not None else img_rgb
+                export_dng(dng_src, path,
                            focus_mm=self._sl_focus.value,
                            f_equiv_mm=self._sl_focal.value,
                            f_number=self._sl_fnum.value)

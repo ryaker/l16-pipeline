@@ -258,14 +258,22 @@ def export_dng(img_rgb: np.ndarray,
     """
     Write a 16-bit linear DNG file (TIFF-based, Lightroom/ACR compatible).
 
-    The image data is scaled uint8→uint16 (× 257) so black = 0, white = 65535.
+    img_rgb may be:
+      - uint8  (H, W, 3) [0..255]  → scaled × 257 to fill 16-bit range
+      - float32 (H, W, 3) [0..65535] → pre-gamma linear (from fused_image_16bit.png)
+
     PhotometricInterpretation = RGB (2), with DNG version tags appended so
     Lightroom recognises it as a raw/DNG file while skipping sensor-level
     demosaic (already processed).
     """
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
 
-    img16 = (img_rgb.astype(np.uint32) * 257).astype(np.uint16)
+    if img_rgb.dtype == np.uint8:
+        # 8-bit display image → scale to full 16-bit range
+        img16 = (img_rgb.astype(np.uint32) * 257).astype(np.uint16)
+    else:
+        # float32 or uint16 in [0..65535] — already 16-bit linear
+        img16 = np.clip(img_rgb, 0, 65535).astype(np.uint16)
 
     now = datetime.datetime.now().strftime('%Y:%m:%d %H:%M:%S')
     desc_parts = ['Light L16 linear DNG - lri_lumen.py']
