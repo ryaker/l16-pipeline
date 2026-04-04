@@ -70,37 +70,59 @@ def find_image_sets(folder: str):
     """
     sets = []
 
+    _SKIP_DIRS = {'frames', 'depth', '__pycache__', '.git'}
+
     def _check_processed(path):
-        ref = first_frame(path)
+        if os.path.basename(path).lower() in _SKIP_DIRS:
+            return None
+        # Support both flat layout (PNGs directly in path) and
+        # cache layout (PNGs in path/frames/, depth in path/fused_*.png)
+        frames_subdir = os.path.join(path, 'frames')
+        if os.path.isdir(frames_subdir):
+            ref = first_frame(frames_subdir)
+            img_path = os.path.join(frames_subdir, f'{ref}.png') if ref else None
+        else:
+            ref = first_frame(path)
+            img_path = os.path.join(path, f'{ref}.png') if ref else None
         if ref is None:
             return None
         depth = os.path.join(path, 'fused_10cams_median_depth.png')
         return {'type':  'processed',
                 'name':  os.path.basename(path),
                 'path':  path,
-                'img':   os.path.join(path, f'{ref}.png'),
+                'img':   img_path,
                 'depth': depth if os.path.isfile(depth) else None}
 
-    entry = _check_processed(folder)
-    if entry:
-        sets.append(entry)
-
-    try:
-        for name in sorted(os.listdir(folder)):
-            full = os.path.join(folder, name)
+    def _scan_dir(path, depth=0):
+        """Scan a directory for LRI files and processed sets (up to 2 levels deep)."""
+        try:
+            entries = sorted(os.listdir(path))
+        except PermissionError:
+            return
+        for name in entries:
+            full = os.path.join(path, name)
             if os.path.isdir(full):
+                # Check if this dir is itself a processed set
                 entry = _check_processed(full)
                 if entry:
                     sets.append(entry)
-            elif name.lower().endswith('.lri') and os.path.isfile(full):
+                elif depth < 2:
+                    # Recurse into date folders etc.
+                    _scan_dir(full, depth + 1)
+            elif (name.lower().endswith('.lri') and os.path.isfile(full)
+                  and not name.startswith('.')):
                 sets.append({'type':  'lri',
                              'name':  name,
                              'path':  full,
                              'img':   None,
                              'depth': None})
-    except PermissionError:
-        pass
 
+    # Also check the root itself
+    entry = _check_processed(folder)
+    if entry:
+        sets.append(entry)
+
+    _scan_dir(folder)
     return sets
 
 
@@ -263,16 +285,24 @@ class LRIThumbnailWorker(QRunnable):
             with tempfile.TemporaryDirectory() as tmpdir:
                 cmd = [sys.executable, self._extract_script,
                        lri, tmpdir, '--scale', '8']
-                result = subprocess.run(cmd, capture_output=True, timeout=60)
+                result = subprocess.run(cmd, capture_output=True, timeout=120)
                 if result.returncode != 0:
-                    raise RuntimeError(result.stderr.decode()[:200])
+                    err = result.stderr.decode().strip()
+                    out = result.stdout.decode().strip()
+                    msg = err or out or f'returncode {result.returncode}'
+                    print(f'[thumb] FAIL {os.path.basename(lri)}: {msg[:300]}',
+                          flush=True)
+                    raise RuntimeError(msg[:200])
                 ref = first_frame(tmpdir)
                 if ref is None:
+                    files = os.listdir(tmpdir)
+                    print(f'[thumb] no frames in {tmpdir}: {files}', flush=True)
                     raise RuntimeError('No frames produced by lri_extract')
                 px = self._display_thumbnail(os.path.join(tmpdir, f'{ref}.png'),
                                              self._thumb_size)
             self.signals.done.emit(lri, px)
         except Exception as e:
+            print(f'[thumb] ERROR {os.path.basename(lri)}: {e}', flush=True)
             self.signals.error.emit(lri, str(e))
 
     @staticmethod
@@ -450,12 +480,15 @@ class LibraryPanel(QWidget):
         self._status.setStyleSheet('color: #888; font-size: 11px;')
         layout.addWidget(self._status)
 
+    # Max concurrent thumbnail extractions (each runs lri_extract subprocess)
+    _MAX_THUMB_WORKERS = 4
+
     def load_folder(self, folder: str):
         self._sets = find_image_sets(folder)
         self._list.clear()
-        self._lri_items = {}   # lri_path → QListWidgetItem
-
-        pool = QThreadPool.globalInstance()
+        self._lri_items  = {}   # lri_path → QListWidgetItem
+        self._thumb_queue = []  # lri paths waiting for thumbnail
+        self._thumb_active = 0  # currently running workers
 
         for s in self._sets:
             if s['type'] == 'processed':
@@ -464,7 +497,6 @@ class LibraryPanel(QWidget):
                 if s['depth'] is None:
                     label += '\n(no depth)'
             else:
-                # LRI: placeholder icon while worker runs
                 ph = QPixmap(140, 140)
                 ph.fill(QColor(45, 45, 55))
                 icon  = QIcon(ph)
@@ -477,10 +509,13 @@ class LibraryPanel(QWidget):
 
             if s['type'] == 'lri':
                 self._lri_items[s['path']] = item
-                worker = LRIThumbnailWorker(s['path'])
-                worker.signals.done.connect(self._on_thumb_ready)
-                worker.signals.error.connect(self._on_thumb_error)
-                pool.start(worker)
+                self._thumb_queue.append(s['path'])
+
+        # Kick off initial batch (visible items)
+        self._pump_thumb_queue()
+
+        # Load more as user scrolls
+        self._list.verticalScrollBar().valueChanged.connect(self._pump_thumb_queue)
 
         n = len(self._sets)
         lri_count = sum(1 for s in self._sets if s['type'] == 'lri')
@@ -493,15 +528,43 @@ class LibraryPanel(QWidget):
         summary = ', '.join(parts) if parts else '0'
         self._status.setText(f'{summary} in {os.path.basename(folder)}')
 
+    def _pump_thumb_queue(self, _=None):
+        """Start thumbnail workers up to _MAX_THUMB_WORKERS, prioritising visible items."""
+        if not self._thumb_queue:
+            return
+        pool = QThreadPool.globalInstance()
+        # Figure out which items are currently visible
+        visible = set()
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            if not self._list.visualItemRect(item).isEmpty():
+                d = item.data(Qt.ItemDataRole.UserRole)
+                if d and d['type'] == 'lri':
+                    visible.add(d['path'])
+        # Re-order queue: visible items first
+        visible_first = [p for p in self._thumb_queue if p in visible]
+        rest = [p for p in self._thumb_queue if p not in visible]
+        self._thumb_queue = visible_first + rest
+
+        while self._thumb_active < self._MAX_THUMB_WORKERS and self._thumb_queue:
+            lri_path = self._thumb_queue.pop(0)
+            self._thumb_active += 1
+            worker = LRIThumbnailWorker(lri_path)
+            worker.signals.done.connect(self._on_thumb_ready)
+            worker.signals.error.connect(self._on_thumb_error)
+            pool.start(worker)
+
     def _on_thumb_ready(self, lri_path: str, pixmap: QPixmap):
+        self._thumb_active = max(0, self._thumb_active - 1)
         item = self._lri_items.get(lri_path)
         if item:
             item.setIcon(QIcon(pixmap))
+        self._pump_thumb_queue()
 
     def _on_thumb_error(self, lri_path: str, msg: str):
+        self._thumb_active = max(0, self._thumb_active - 1)
         item = self._lri_items.get(lri_path)
         if item:
-            # Draw a simple error indicator on the placeholder
             ph = QPixmap(140, 140)
             ph.fill(QColor(60, 30, 30))
             painter = QPainter(ph)
@@ -509,6 +572,8 @@ class LibraryPanel(QWidget):
             painter.drawText(ph.rect(), Qt.AlignmentFlag.AlignCenter, '⚠ read\nerror')
             painter.end()
             item.setIcon(QIcon(ph))
+            item.setToolTip(msg)   # hover to see actual error
+        self._pump_thumb_queue()
 
     def _pick_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Open Image Folder')
@@ -531,7 +596,7 @@ class LabeledSlider(QWidget):
         self._lo = lo
         self._hi = hi
         self._step = step
-        self._scale = round(1.0 / step)
+        self._scale = max(1, round(1.0 / step))
 
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
@@ -577,22 +642,21 @@ class RenderSignals(QObject):
 
 
 class RenderWorker(QRunnable):
-    def __init__(self, img_rgb, depth, focus_mm, f_equiv, f_number,
-                 exp, cont, hilite, shadow, wb_r, wb_b, sat, sharp, scale):
+    """Runs apply_bokeh in a thread; emits raw bokeh (no tone adjustments).
+    Tone adjustments are always applied in the main thread so _bokeh_preview
+    stays un-adjusted and sliders can re-apply without stacking."""
+
+    def __init__(self, img_rgb, depth, focus_mm, f_equiv, f_number, scale):
         super().__init__()
         self.signals = RenderSignals()
-        self._args = (img_rgb, depth, focus_mm, f_equiv, f_number,
-                      exp, cont, hilite, shadow, wb_r, wb_b, sat, sharp, scale)
+        self._args = (img_rgb, depth, focus_mm, f_equiv, f_number, scale)
 
     def run(self):
         try:
-            img_rgb, depth, focus_mm, f_equiv, f_number, \
-            exp, cont, hilite, shadow, wb_r, wb_b, sat, sharp, scale = self._args
+            img_rgb, depth, focus_mm, f_equiv, f_number, scale = self._args
             bokeh = apply_bokeh(img_rgb, depth, focus_mm, f_number, f_equiv,
                                 preview_scale=scale)
-            result = apply_adjustments(bokeh, exp, cont, hilite, shadow,
-                                       wb_r, wb_b, sat, sharp)
-            self.signals.finished.emit(result)
+            self.signals.finished.emit(bokeh)
         except Exception as e:
             self.signals.error.emit(str(e))
 
@@ -980,8 +1044,6 @@ class LumenWindow(QMainWindow):
             self._sl_focus.value,
             self._sl_focal.value,
             self._sl_fnum.value,
-            # Tone args neutral — we apply them separately after
-            0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0,
             0.25,  # always preview scale
         )
         worker.signals.finished.connect(self._on_bokeh_preview_done)
@@ -1023,6 +1085,17 @@ class LumenWindow(QMainWindow):
             self._sl_focus.value,
             self._sl_focal.value,
             self._sl_fnum.value,
+            1.0,  # full resolution
+        )
+        worker.signals.finished.connect(self._on_render_done)
+        worker.signals.error.connect(self._on_render_error)
+        self._pool.start(worker)
+
+    def _on_render_done(self, bokeh_raw: np.ndarray):
+        # Store raw bokeh (no adjustments) so tone sliders can re-apply without stacking
+        self._bokeh_preview = bokeh_raw
+        result = apply_adjustments(
+            bokeh_raw,
             self._sl_exp.value,
             self._sl_cont.value,
             self._sl_hi.value,
@@ -1031,16 +1104,8 @@ class LumenWindow(QMainWindow):
             self._sl_wb_b.value,
             self._sl_sat.value,
             self._sl_sharp.value,
-            1.0,  # full resolution
         )
-        worker.signals.finished.connect(self._on_render_done)
-        worker.signals.error.connect(self._on_render_error)
-        self._pool.start(worker)
-
-    def _on_render_done(self, result: np.ndarray):
         self._current_result = result
-        # Also store as bokeh_preview (at full res) so tone sliders stay live
-        self._bokeh_preview = result
         self._show_image(result)
         self._btn_apply.setEnabled(True)
         self._btn_apply.setText('Render Full Res')
