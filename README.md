@@ -33,15 +33,33 @@ The desktop app (`lri_lumen_app.py`) is a Lightroom-style editor:
 
 ---
 
+## What you do NOT need
+
+- **Lumen.app** — the original Light desktop app. This project is a complete replacement; the binary is not used anywhere.
+- **lri-cpp** — a C++ LRI parser (reference only; `lri_process.cpp` is included for documentation). Not required to run the pipeline.
+- **RAFT-Stereo** — an alternative stereo depth approach explored during development. Not used by the main pipeline.
+
+---
+
 ## Requirements
 
 **Python 3.11+** and the following packages:
+
+### Desktop app (`lri_lumen_app.py`) — required
 
 ```bash
 pip install PySide6 numpy opencv-python pillow
 ```
 
-**Apple Depth Pro** (monocular depth estimation):
+### Core algorithms (`lri_lumen.py`) — required if using the app or Gradio UI
+
+```bash
+pip install numpy opencv-python tifffile
+# Only needed for the Gradio web UI (lri_lumen.py --gradio):
+pip install gradio
+```
+
+### Apple Depth Pro — required for depth estimation
 
 ```bash
 git clone https://github.com/apple/ml-depth-pro.git
@@ -54,10 +72,15 @@ python -c "from depth_pro import create_model_and_transforms; create_model_and_t
 
 The `ml-depth-pro/` directory must live **next to** the pipeline scripts (same folder).
 
-**Optional** (for PLY point cloud export in `lri_fuse_depth.py`):
+### Optional extras
+
 ```bash
-pip install open3d
+pip install open3d        # PLY point cloud export in lri_fuse_depth.py
+pip install torch         # Required by lri_depth_mps.py (MPS multi-view fusion)
+pip install mlx           # Required by lri_depth_mlx.py (Apple MLX fusion)
 ```
+
+`lri_depth_mps.py` and `lri_depth_mlx.py` are experimental alternatives to Depth Pro for multi-view stereo depth. The main pipeline only needs Depth Pro.
 
 ---
 
