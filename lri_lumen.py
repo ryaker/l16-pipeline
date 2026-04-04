@@ -282,39 +282,35 @@ def export_dng(img_rgb: np.ndarray,
     if f_number   is not None: desc_parts.append(f'f/{f_number:.1f}')
     description = ', '.join(desc_parts)
 
-    # DNG-specific extra tags
+    # DNG-specific extra tags — MUST be sorted ascending by tag code.
     # Format: (tag_code, tiff_type_int, count, value, writeonce)
     # TIFF types: 1=BYTE 2=ASCII 3=SHORT 4=LONG 5=RATIONAL 7=UNDEFINED 10=SRATIONAL
+    #
+    # For RATIONAL/SRATIONAL: pass flat tuples of ints (alternating num/den pairs).
+    # Do NOT use struct.pack bytes — tifffile miscounts the RATIONAL pair size.
 
-    # ColorMatrix1: sRGB → XYZ_D50 (required by DNG spec; LibRaw/Mylio reject without it)
-    # Values × 10000 to give good rational precision
-    _cm1 = struct.pack('<18i',
-        4361, 10000,  3851, 10000,  1431, 10000,
-        2225, 10000,  7169, 10000,   606, 10000,
-         139, 10000,   971, 10000,  7142, 10000,
-    )
-    # ForwardMatrix1: XYZ_D50 → sRGB (helps Lightroom/Mylio white-balance)
-    _fm1 = struct.pack('<18i',
-        13274, 10000,  -5232, 10000,  -1348, 10000,
-        -4698, 10000,  15020, 10000,    -81, 10000,
-          344, 10000,  -2557, 10000,   9856, 10000,
-    )
-    # AsShotNeutral = (1/1, 1/1, 1/1) — already white-balanced in-app
-    _asn = struct.pack('<6I', 1, 1, 1, 1, 1, 1)
+    # ColorMatrix1: camera RGB → XYZ_D50  (sRGB primaries; good generic starting point)
+    # AsShotNeutral = 1/1 per channel — WB baked in, so neutral
+    # ForwardMatrix1: XYZ_D50 → sRGB
 
+    # Tags in STRICTLY ASCENDING code order — tifffile requires this
     extra_tags = [
-        (254,   4,  1, 0,                    True),   # NewSubFileType = 0 (full-res)
-        (50706, 1,  4, bytes([1, 4, 0, 0]),  True),   # DNGVersion = 1.4
-        (50707, 1,  4, bytes([1, 1, 0, 0]),  True),   # DNGBackwardVersion = 1.1
-        (50708, 2,  0, 'Light L16',          True),   # UniqueCameraModel
-        (50717, 4,  1, 65535,                True),   # WhiteLevel
-        (50778, 3,  1, 21,                   True),   # CalibrationIlluminant1 = D65
-        (50721, 10, 9, _cm1,                 True),   # ColorMatrix1
-        (50964, 10, 9, _fm1,                 True),   # ForwardMatrix1
-        (50728, 5,  3, _asn,                 True),   # AsShotNeutral = (1,1,1)
-        (50730, 10, 1, (0, 1),               True),   # BaselineExposure = 0
-        (50731, 5,  1, (1, 1),               True),   # BaselineNoise = 1
-        (50732, 5,  1, (1, 1),               True),   # BaselineSharpness = 1
+        (254,   4,   1,  0,                          True),  # NewSubFileType = 0
+        (50706, 1,   4,  bytes([1, 4, 0, 0]),        True),  # DNGVersion = 1.4
+        (50707, 1,   4,  bytes([1, 1, 0, 0]),        True),  # DNGBackwardVersion = 1.1
+        (50708, 2,   0,  'Light L16',                True),  # UniqueCameraModel
+        (50717, 4,   1,  65535,                      True),  # WhiteLevel
+        (50721, 10,  9,  (4361, 10000,  3851, 10000,  1431, 10000,   # ColorMatrix1
+                          2225, 10000,  7169, 10000,   606, 10000,
+                           139, 10000,   971, 10000,  7142, 10000),  True),
+        (50728, 5,   3,  (1, 1,  1, 1,  1, 1),       True),  # AsShotNeutral = 1/1, 1/1, 1/1
+        (50730, 10,  1,  (0, 1),                     True),  # BaselineExposure = 0
+        (50731, 5,   1,  (1, 1),                     True),  # BaselineNoise = 1
+        (50732, 5,   1,  (1, 1),                     True),  # BaselineSharpness = 1
+        (50778, 3,   1,  21,                         True),  # CalibrationIlluminant1 = D65
+        (50964, 10,  9,  (13274, 10000, -5232, 10000, -1348, 10000,  # ForwardMatrix1
+                          -4698, 10000, 15020, 10000,   -81, 10000,
+                            344, 10000, -2557, 10000,  9856, 10000), True),
     ]
 
     tifffile.imwrite(
