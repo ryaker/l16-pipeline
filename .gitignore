@@ -1,0 +1,21 @@
+# Directories to exclude
+LRI/
+Lumen/
+lri-cpp/
+ml-depth-pro/
+RAFT-Stereo/
+__pycache__/
+
+# File extensions to exclude
+*.out
+*.dng
+*.tiff
+*.hdr
+*.raw
+*.info
+
+# macOS
+.DS_Store
+
+# Build script
+build.sh
