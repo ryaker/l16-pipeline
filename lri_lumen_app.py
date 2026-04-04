@@ -676,6 +676,7 @@ class LumenWindow(QMainWindow):
         self._bokeh_preview = None       # bokeh at 0.25 scale — reused by tone sliders
         self._current_result = None
         self._export_fmt_pending = None  # set when export needs a full-res render first
+        self._export_stem = 'L16_lumen'  # updated when an image is loaded
         self._pool = QThreadPool.globalInstance()
         self._render_pending = False
 
@@ -861,6 +862,8 @@ class LumenWindow(QMainWindow):
         self._status(f'Loading {data["name"]}...')
         self._progress.show()
         QApplication.processEvents()
+        # Track stem for export filename (e.g. "L16_01922" from "L16_01922.lri")
+        self._export_stem = os.path.splitext(data['name'])[0]
 
         try:
             # data['img'] and data['depth'] hold explicit file paths
@@ -1164,10 +1167,9 @@ class LumenWindow(QMainWindow):
         self._do_export(fmt, self._current_result)
 
     def _do_export(self, fmt: str, img_rgb: np.ndarray):
-        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         ext_map = {'png': 'PNG files (*.png)', 'dng': 'DNG files (*.dng)',
                    'jpg': 'JPEG files (*.jpg)'}
-        default_name = f'L16_lumen_{ts}.{fmt}'
+        default_name = f'{self._export_stem}_lumen.{fmt}'
         path, _ = QFileDialog.getSaveFileName(
             self, 'Save Image', default_name, ext_map.get(fmt, '*.*'))
         if not path:

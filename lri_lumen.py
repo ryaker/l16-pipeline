@@ -173,6 +173,11 @@ def apply_bokeh(img_rgb: np.ndarray,
     if beyond.any():
         result[beyond] = layers[-1][beyond]
 
+    # Zero-depth pixels have no valid depth data — pass through original, never black
+    no_depth = (depth_work == 0)
+    if no_depth.any():
+        result[no_depth] = img_f[no_depth]
+
     out = np.clip(result, 0, 255).astype(np.uint8)
 
     if preview_scale < 1.0:
