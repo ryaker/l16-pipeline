@@ -6,6 +6,33 @@ The Light L16 captured 10 simultaneous RAW frames (5 wide + 5 tele) and used com
 
 ---
 
+## Working On Now
+
+### Live tone sliders ✅ (just landed)
+Tone controls (exposure, contrast, highlights, shadows, WB, saturation, sharpness) now update the image in real time as you drag — no need to click "Apply Bokeh". The bokeh computation result is cached separately from the tone pass so live feedback is instant.
+
+### 16-bit frame extraction ✅ (just landed)
+`lri_extract.py` was saving 8-bit PNG frames (10-bit data >> 2), which crushed dynamic range and made highlights/shadows sliders useless. Now saves 16-bit PNG (10-bit × 64 → uint16) so the full tonal range is available for adjustments.
+
+### DNG Mylio/Lightroom compatibility (in test)
+Rewrote `export_dng()` to match the canonical camera DNG IFD layout: IFD0 = 8-bit sRGB thumbnail with all DNG metadata tags, SubIFD = full-res 16-bit LinearRaw. Previous version had the structure inverted. Luminar Neo confirmed working; Mylio testing in progress.
+
+---
+
+## Still to Come
+
+| Feature | Notes |
+|---------|-------|
+| Per-camera color normalization | Each L16 camera has slightly different color response (G/R ratio varies 1.40–1.65). Normalize all cameras to the reference before fusion to fix color casts in multi-cam output. |
+| Laplacian pyramid blending | Replace weighted-average fusion with multi-scale pyramid blending (blend low/high frequencies separately). Eliminates halo artifacts at depth boundaries. |
+| Exposure fusion (Mertens style) | B4 camera shoots at ~½ the exposure of other cameras (HDR bracketed shot). Use it for highlight recovery in blown regions instead of discarding it. |
+| BAYER_JPEG extraction | 2018-06-26 LRI files use surface format 0 (4 half-res JPEGs per Bayer channel). Decoder spec in `L16-Pipeline-Spec.md`. Unblocks a large set of images. |
+| Better A-group SR | DBSR / RCAN learned super-resolution on the 5-camera A-group stack instead of straight weighted average. |
+| Real-ESRGAN upscale | 2× resolution post-fusion using Real-ESRGAN. |
+| HDR merge | Merge all 4 exposures per camera (Mertens / HDR-Transformer) instead of using only exposure 0. |
+
+---
+
 ## What it does
 
 ```
@@ -161,6 +188,6 @@ See `lri_lumen.py:apply_bokeh()` for implementation.
 
 ## Notes
 
-- Raw sensor output is linear light — `lri_extract.py` outputs 8-bit PNGs with no gamma or white balance. The app applies grey-world AWB and gamma 2.2 for display.
+- Raw sensor output is linear light — `lri_extract.py` outputs **16-bit PNGs** (10-bit × 64 → uint16) with no gamma or white balance. The app applies grey-world AWB and gamma 2.2 for display.
 - Depth Pro must be run from the `ml-depth-pro/` directory (checkpoint path is relative).
 - The pipeline works with any LRI variant — it auto-detects which cameras are present (A/B/C series) and uses the first available as the reference frame.

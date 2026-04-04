@@ -46,13 +46,47 @@ def parse_args():
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 def load_data(frames_dir: str, fused_dir: str):
-    img_path   = os.path.join(frames_dir, 'A1.png')
-    depth_path = os.path.join(fused_dir,  'fused_10cams_median_depth.png')
+    # Find best available reference frame.  A1 is ideal (wide, full-frame
+    # coverage); fall back to B1, C1 for B/C-only files (2018-02 era).
+    _CANDIDATES = ['A1', 'B1', 'C1', 'A2', 'B2', 'C2', 'A3', 'B3']
+    img_path = None
+    for cand in _CANDIDATES:
+        p = os.path.join(frames_dir, f'{cand}.png')
+        if os.path.exists(p):
+            img_path = p
+            break
+    if img_path is None:
+        raise FileNotFoundError(
+            f'No reference frame found in {frames_dir}  '
+            f'(tried {", ".join(_CANDIDATES)})')
 
-    img_bgr = cv2.imread(img_path)
+    depth_path = os.path.join(fused_dir, 'fused_10cams_median_depth.png')
+
+    # Load with IMREAD_UNCHANGED so 16-bit PNGs stay 16-bit.
+    img_bgr = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
     if img_bgr is None:
         raise FileNotFoundError(f'Cannot load image: {img_path}')
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    # ── Normalise to float [0..1] linear ──────────────────────────────────────
+    max_val = 65535.0 if img_rgb.dtype == np.uint16 else 255.0
+    img_f = img_rgb.astype(np.float32) / max_val
+
+    # ── Grey-world auto white-balance ─────────────────────────────────────────
+    # L16 raw data has a strong green bias (G/R ≈ 1.6, G/B ≈ 1.3) inherited
+    # from the sensor's Bayer CFA.  Without correction the initial display
+    # looks greenish and WB sliders must be hand-tuned.  Applying grey-world
+    # here gives a neutral starting point; the WB sliders allow fine-tuning.
+    r_m, g_m, b_m = img_f[:, :, 0].mean(), img_f[:, :, 1].mean(), img_f[:, :, 2].mean()
+    if r_m > 1e-5 and b_m > 1e-5 and g_m > 1e-5:
+        img_f[:, :, 0] = np.clip(img_f[:, :, 0] * (g_m / r_m), 0, 1)
+        img_f[:, :, 2] = np.clip(img_f[:, :, 2] * (g_m / b_m), 0, 1)
+
+    # ── Gamma encode for display (linear → sRGB ≈ gamma 2.2) ─────────────────
+    # The raw sensor data is linear-light.  Without gamma encoding the image
+    # appears much darker than expected on a typical monitor.
+    img_f = np.power(np.clip(img_f, 0, 1), 1.0 / 2.2)
+    img_rgb = (img_f * 255.0).astype(np.uint8)
 
     depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
     if depth is None:
@@ -256,25 +290,41 @@ def export_dng(img_rgb: np.ndarray,
                f_equiv_mm: float | None = None,
                f_number: float | None = None) -> str:
     """
-    Write a 16-bit linear DNG file (TIFF-based, Lightroom/ACR compatible).
+    Write a 16-bit linear DNG file (TIFF-based, Lightroom/Mylio/ACR compatible).
+
+    Structure (mirrors camera-origin DNGs from Adobe DNG Converter):
+      IFD0  — sRGB thumbnail (8-bit, NewSubfileType=1) + ALL DNG metadata tags
+              SubIFDs tag → links to SubIFD below
+      SubIFD— full-resolution 16-bit LinearRaw (NewSubfileType=0)
+              DefaultCropOrigin/Size so readers know exact valid pixel area
+
+    Putting metadata in IFD0 and full-res in SubIFD matches what Mylio,
+    Lightroom, and ACR expect — they follow the camera DNG convention.
 
     img_rgb may be:
       - uint8  (H, W, 3) [0..255]  → scaled × 257 to fill 16-bit range
       - float32 (H, W, 3) [0..65535] → pre-gamma linear (from fused_image_16bit.png)
-
-    PhotometricInterpretation = RGB (2), with DNG version tags appended so
-    Lightroom recognises it as a raw/DNG file while skipping sensor-level
-    demosaic (already processed).
     """
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
 
     if img_rgb.dtype == np.uint8:
-        # 8-bit display image → scale to full 16-bit range
         img16 = (img_rgb.astype(np.uint32) * 257).astype(np.uint16)
     else:
-        # float32 or uint16 in [0..65535] — already 16-bit linear
         img16 = np.clip(img_rgb, 0, 65535).astype(np.uint16)
 
+    # Apply grey-world white balance to the export data.
+    # The fused 16-bit PNG has native sensor colour bias (G/R ≈ 1.3); without
+    # correction DNG apps display a strong green cast regardless of ColorMatrix.
+    img_f = img16.astype(np.float32)
+    r_mean = img_f[:, :, 0].mean()
+    g_mean = img_f[:, :, 1].mean()
+    b_mean = img_f[:, :, 2].mean()
+    if r_mean > 0 and b_mean > 0 and g_mean > 0:
+        img_f[:, :, 0] *= (g_mean / r_mean)
+        img_f[:, :, 2] *= (g_mean / b_mean)
+    img16 = np.clip(img_f, 0, 65535).astype(np.uint16)
+
+    H, W = img16.shape[:2]
     now = datetime.datetime.now().strftime('%Y:%m:%d %H:%M:%S')
     desc_parts = ['Light L16 linear DNG - lri_lumen.py']
     if focus_mm   is not None: desc_parts.append(f'Focus {focus_mm:.0f} mm')
@@ -282,48 +332,81 @@ def export_dng(img_rgb: np.ndarray,
     if f_number   is not None: desc_parts.append(f'f/{f_number:.1f}')
     description = ', '.join(desc_parts)
 
-    # DNG-specific extra tags — MUST be sorted ascending by tag code.
-    # Format: (tag_code, tiff_type_int, count, value, writeonce)
-    # TIFF types: 1=BYTE 2=ASCII 3=SHORT 4=LONG 5=RATIONAL 7=UNDEFINED 10=SRATIONAL
-    #
-    # For RATIONAL/SRATIONAL: pass flat tuples of ints (alternating num/den pairs).
-    # Do NOT use struct.pack bytes — tifffile miscounts the RATIONAL pair size.
+    # ── Thumbnail: 1/8 scale, gamma-corrected sRGB 8-bit ────────────────────
+    # Gamma correction (linear → sRGB ≈ gamma 2.2) so thumbnail looks correct
+    # in Mylio/Lightroom library view and as the DNG's embedded preview.
+    thumb_lin = img16[::8, ::8].astype(np.float32) / 65535.0
+    thumb_lin = np.clip(thumb_lin, 0.0, 1.0)
+    thumb8 = np.power(thumb_lin, 1.0 / 2.2)
+    thumb8 = np.clip(thumb8 * 255.0, 0, 255).astype(np.uint8)
 
-    # ColorMatrix1: camera RGB → XYZ_D50  (sRGB primaries; good generic starting point)
-    # AsShotNeutral = 1/1 per channel — WB baked in, so neutral
-    # ForwardMatrix1: XYZ_D50 → sRGB
-
-    # Tags in STRICTLY ASCENDING code order — tifffile requires this
-    extra_tags = [
-        (254,   4,   1,  0,                          True),  # NewSubFileType = 0
-        (50706, 1,   4,  bytes([1, 4, 0, 0]),        True),  # DNGVersion = 1.4
-        (50707, 1,   4,  bytes([1, 1, 0, 0]),        True),  # DNGBackwardVersion = 1.1
-        (50708, 2,   0,  'Light L16',                True),  # UniqueCameraModel
-        (50717, 4,   1,  65535,                      True),  # WhiteLevel
-        (50721, 10,  9,  (4361, 10000,  3851, 10000,  1431, 10000,   # ColorMatrix1
-                          2225, 10000,  7169, 10000,   606, 10000,
-                           139, 10000,   971, 10000,  7142, 10000),  True),
-        (50728, 5,   3,  (1, 1,  1, 1,  1, 1),       True),  # AsShotNeutral = 1/1, 1/1, 1/1
-        (50730, 10,  1,  (0, 1),                     True),  # BaselineExposure = 0
-        (50731, 5,   1,  (1, 1),                     True),  # BaselineNoise = 1
-        (50732, 5,   1,  (1, 1),                     True),  # BaselineSharpness = 1
-        (50778, 3,   1,  21,                         True),  # CalibrationIlluminant1 = D65
-        (50964, 10,  9,  (13274, 10000, -5232, 10000, -1348, 10000,  # ForwardMatrix1
-                          -4698, 10000, 15020, 10000,   -81, 10000,
-                            344, 10000, -2557, 10000,  9856, 10000), True),
+    # ── IFD0 extra-tags (DNG metadata + thumbnail colour space) ─────────────
+    # All DNG metadata MUST live in IFD0.  tifffile handles tags 254/282/283/296
+    # via its own params (subfiletype, resolution, resolutionunit) — exclude here.
+    # TIFF types: 1=BYTE 2=ASCII 3=SHORT 4=LONG 5=RATIONAL 7=UNDEF 10=SRATIONAL
+    # RATIONAL/SRATIONAL value: flat int tuple (num, den, num, den, …).
+    # Strictly ascending tag code order required.
+    ifd0_tags = [
+        (271,   2,   0,  'Light',                     True),  # Make
+        (272,   2,   0,  'L16',                       True),  # Model
+        (50706, 1,   4,  bytes([1, 4, 0, 0]),         True),  # DNGVersion = 1.4
+        (50707, 1,   4,  bytes([1, 1, 0, 0]),         True),  # DNGBackwardVersion = 1.1
+        (50708, 2,   0,  'Light L16',                 True),  # UniqueCameraModel
+        (50714, 4,   1,  0,                           True),  # BlackLevel = 0
+        (50717, 4,   1,  65535,                       True),  # WhiteLevel = 65535
+        # ColorMatrix1: identity — data is already processed linear sRGB.
+        # A real camera-to-XYZ matrix on pre-processed data would cause a
+        # double-correction.  Identity passes colour through unchanged.
+        (50721, 10,  9,  (1, 1,  0, 1,  0, 1,         # ColorMatrix1 = identity 3×3
+                          0, 1,  1, 1,  0, 1,
+                          0, 1,  0, 1,  1, 1),         True),
+        (50728, 5,   3,  (1, 1,  1, 1,  1, 1),        True),  # AsShotNeutral = 1 × 3
+        (50730, 10,  1,  (0, 1),                      True),  # BaselineExposure = 0
+        (50731, 5,   1,  (1, 1),                      True),  # BaselineNoise = 1
+        (50732, 5,   1,  (1, 1),                      True),  # BaselineSharpness = 1
+        (50778, 3,   1,  21,                          True),  # CalibrationIlluminant1 = D65
+        (50964, 10,  9,  (1, 1,  0, 1,  0, 1,         # ForwardMatrix1 = identity 3×3
+                          0, 1,  1, 1,  0, 1,
+                          0, 1,  0, 1,  1, 1),         True),
+        (50970, 3,   1,  2,                           True),  # PreviewColorSpace = sRGB
     ]
 
-    tifffile.imwrite(
-        output_path,
-        img16,
-        photometric='rgb',
-        compression=None,
-        software='lri_lumen.py',
-        datetime=now,
-        description=description,
-        extratags=extra_tags,
-        metadata=None,
-    )
+    # ── SubIFD extra-tags (full-res image crop boundaries) ───────────────────
+    subifd_tags = [
+        (50719, 4,   2,  (0, 0),                      True),  # DefaultCropOrigin
+        (50720, 4,   2,  (W, H),                      True),  # DefaultCropSize
+    ]
+
+    with tifffile.TiffWriter(output_path, bigtiff=False) as tw_obj:
+        # IFD0 — thumbnail (8-bit sRGB) + all DNG metadata.
+        # subifds=1 creates a SubIFDs tag in IFD0 pointing to the full-res SubIFD.
+        # This matches the canonical camera DNG layout that Mylio/Lightroom expect.
+        tw_obj.write(
+            thumb8,
+            photometric='rgb',
+            compression=None,
+            subfiletype=1,           # reduced-resolution preview
+            subifds=1,               # next write() → SubIFD (full-res raw data)
+            resolution=(72, 72, 'inch'),
+            software='lri_lumen.py',
+            datetime=now,
+            description=description,
+            extratags=ifd0_tags,
+            metadata=None,
+        )
+
+        # SubIFD — full-resolution 16-bit LinearRaw.
+        # Linked via SubIFDs tag in IFD0.  Readers that understand DNG will find
+        # the full-res image here; legacy TIFF readers see the thumbnail in IFD0.
+        tw_obj.write(
+            img16,
+            photometric=34892,       # LinearRaw (DNG processed RGB)
+            compression=None,
+            subfiletype=0,           # full-resolution primary image
+            extratags=subifd_tags,
+            metadata=None,
+        )
+
     return output_path
 
 
@@ -440,6 +523,7 @@ def build_ui(img_rgb: np.ndarray,
         # ── State ──────────────────────────────────────────────────────────────
         state_focus_mm    = gr.State(value=depth_median)
         state_result_img  = gr.State(value=img_preview)
+        state_bokeh_img   = gr.State(value=img_preview)   # bokeh-applied, pre-tone
         state_f_equiv     = gr.State(value=35.0)
         state_f_number    = gr.State(value=1.8)
         state_is_preview  = gr.State(value=True)
@@ -517,17 +601,21 @@ def build_ui(img_rgb: np.ndarray,
             wb_r_slider, wb_b_slider, saturation_slider, sharpness_slider,
         ]
 
-        def _render_full(focus_mm, f_equiv, f_number,
-                         exp, cont, hilite, shadow, wb_r, wb_b, sat, sharp,
-                         scale=1.0):
-            """Render bokeh + tone at requested scale, returned as full-res uint8."""
-            bokeh = apply_bokeh(
+        def _render_bokeh(focus_mm, f_equiv, f_number, scale=1.0):
+            """Apply bokeh only (no tone). Returns uint8 RGB."""
+            return apply_bokeh(
                 img_rgb, depth,
                 focus_mm=float(focus_mm),
                 f_number=float(f_number),
                 f_equiv_mm=float(f_equiv),
                 preview_scale=scale,
             )
+
+        def _render_full(focus_mm, f_equiv, f_number,
+                         exp, cont, hilite, shadow, wb_r, wb_b, sat, sharp,
+                         scale=1.0):
+            """Render bokeh + tone at requested scale, returned as full-res uint8."""
+            bokeh = _render_bokeh(focus_mm, f_equiv, f_number, scale=scale)
             return apply_adjustments(bokeh,
                 exposure=float(exp), contrast=float(cont),
                 highlights=float(hilite), shadows=float(shadow),
@@ -539,20 +627,41 @@ def build_ui(img_rgb: np.ndarray,
             is_prev = 'fast' in quality
             scale = 0.25 if is_prev else 1.0
             gr.Info(f'Rendering (focus {float(focus_mm):.0f} mm, f/{float(f_number):.1f})...')
-            result = _render_full(focus_mm, f_equiv, f_number,
-                                  exp, cont, hilite, shadow, wb_r, wb_b, sat, sharp,
-                                  scale=scale)
+            bokeh = _render_bokeh(focus_mm, f_equiv, f_number, scale=scale)
+            result = apply_adjustments(bokeh,
+                exposure=float(exp), contrast=float(cont),
+                highlights=float(hilite), shadows=float(shadow),
+                wb_r=float(wb_r), wb_b=float(wb_b),
+                saturation=float(sat), sharpness=float(sharp))
             result_prev = cv2.resize(result, (PREV_W, PREV_H), interpolation=cv2.INTER_AREA)
+            bokeh_prev  = cv2.resize(bokeh,  (PREV_W, PREV_H), interpolation=cv2.INTER_AREA)
             display = _render_view(view, result_prev)
-            return display, result_prev, float(f_equiv), float(f_number), is_prev
+            return display, result_prev, bokeh_prev, float(f_equiv), float(f_number), is_prev
 
         bokeh_btn.click(
             on_apply_bokeh,
             inputs=[state_focus_mm, f_equiv_slider, f_number_slider,
                     preview_quality, view_mode] + _tone_inputs,
-            outputs=[img_display, state_result_img, state_f_equiv,
-                     state_f_number, state_is_preview],
+            outputs=[img_display, state_result_img, state_bokeh_img,
+                     state_f_equiv, state_f_number, state_is_preview],
         )
+
+        def on_tone_change(bokeh_img, view,
+                           exp, cont, hilite, shadow, wb_r, wb_b, sat, sharp):
+            """Live tone slider update — re-applies tone to stored bokeh image."""
+            result = apply_adjustments(bokeh_img,
+                exposure=float(exp), contrast=float(cont),
+                highlights=float(hilite), shadows=float(shadow),
+                wb_r=float(wb_r), wb_b=float(wb_b),
+                saturation=float(sat), sharpness=float(sharp))
+            return _render_view(view, result), result
+
+        for _s in _tone_inputs:
+            _s.change(
+                on_tone_change,
+                inputs=[state_bokeh_img, view_mode] + _tone_inputs,
+                outputs=[img_display, state_result_img],
+            )
 
         def on_reset(view):
             info = (

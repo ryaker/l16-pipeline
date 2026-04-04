@@ -24,6 +24,7 @@ import math
 import argparse
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 from PIL import Image as PILImage
 
@@ -445,9 +446,10 @@ def _save_rgb(
         pil = PILImage.fromarray(rgb.astype(np.uint16))
         pil.save(path)
     else:
-        # 8-bit PNG (scale down from 10-bit to 8-bit)
-        rgb8 = (rgb >> 2).astype(np.uint8)   # 10-bit → 8-bit
-        PILImage.fromarray(rgb8).save(path)
+        # 16-bit PNG: scale 10-bit [0..1023] → 16-bit [0..65535]
+        rgb16 = (rgb.astype(np.uint32) * 64).clip(0, 65535).astype(np.uint16)
+        # cv2 expects BGR; imwrite with uint16 writes proper 16-bit PNG
+        cv2.imwrite(path, cv2.cvtColor(rgb16, cv2.COLOR_RGB2BGR))
 
     return path
 
