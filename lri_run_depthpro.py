@@ -146,7 +146,20 @@ def main():
         
         t_start = time.time()
         image, _, _ = load_rgb(img_path)
-        
+
+        # L16 images are linear light (uint16 → uint8 high-byte = still linear).
+        # Depth Pro was trained on sRGB-gamma-encoded images. Apply sRGB transfer function.
+        image_f = image.astype(np.float32) / 255.0
+        mask = image_f <= 0.0031308
+        image_srgb = np.where(
+            mask,
+            12.92 * image_f,
+            1.055 * (image_f ** (1.0 / 2.4)) - 0.055
+        )
+        image = np.clip(image_srgb * 255.0, 0, 255).astype(np.uint8)
+
+        print(f"[depth-pro] {cam_name}: image shape={image.shape} dtype={image.dtype} p50={np.median(image):.0f} p99={np.percentile(image, 99):.0f}")
+
         with torch.no_grad():
             # CRITICAL: f_px must be a torch tensor, not a plain float
             f_px_tensor = torch.tensor(f_px, dtype=torch.float32, device=device)
