@@ -119,8 +119,13 @@ def load_depth_map(lumen_dir: str, ref_name: str,
     Load the best available depth map for the reference camera.
 
     Priority:
-      1. fused_*cams_median_depth.png  — multi-camera median fusion (uint16, mm)
-      2. depth/<ref_name>.npz          — single-camera Depth Pro output (float32, m)
+      1. depth/mvs_a_cameras.npz       — PatchMatch MVS (metric, virtual A-cam frame)
+      2. fused_*cams_median_depth.png  — multi-camera median fusion (uint16, mm)
+      3. depth/<ref_name>.npz          — single-camera Depth Pro output (float32, m)
+
+    MVS depth is in the virtual A-camera frame (centroid of A1-A5).  For B-camera
+    depth_reproject_warp this is close enough to A1's frame — the A-group centroid
+    is within ~35mm of A1, sub-pixel parallax at any scene depth > 5m.
 
     Returns float32 (H, W) depth in METRES, or None if nothing found.
     target_hw : (H, W) to resize depth map to if shape differs.
@@ -129,7 +134,19 @@ def load_depth_map(lumen_dir: str, ref_name: str,
 
     H_ref, W_ref = target_hw
 
-    # Priority 1: fused multi-camera depth PNG (mm uint16)
+    # Priority 1: PatchMatch MVS depth (metric, geometrically consistent)
+    mvs_path = os.path.join(lumen_dir, 'depth', 'mvs_a_cameras.npz')
+    if os.path.exists(mvs_path):
+        d = np.load(mvs_path)['depth'].astype(np.float32)
+        if d.shape != (H_ref, W_ref):
+            d = cv2.resize(d, (W_ref, H_ref), interpolation=cv2.INTER_LINEAR)
+        valid = d > 0
+        print(f"  Depth map: depth/mvs_a_cameras.npz "
+              f"({d[valid].min():.1f}–{d[valid].max():.1f}m, "
+              f"{100*valid.mean():.0f}% valid)")
+        return d
+
+    # Priority 2: fused multi-camera depth PNG (mm uint16)
     fused_candidates = sorted(_glob.glob(
         os.path.join(lumen_dir, 'fused_*cams_median_depth.png')))
     if fused_candidates:
@@ -144,7 +161,7 @@ def load_depth_map(lumen_dir: str, ref_name: str,
                   f"{100*(d>0).mean():.0f}% valid)")
             return d
 
-    # Priority 2: single-camera Depth Pro .npz
+    # Priority 3: single-camera Depth Pro .npz
     npz_path = os.path.join(lumen_dir, 'depth', f'{ref_name}.npz')
     if os.path.exists(npz_path):
         d = np.load(npz_path)['depth'].astype(np.float32)
@@ -842,8 +859,9 @@ def fuse_frames(frames_dir: str, cal_path: str, output_path: str) -> str:
     # ── Group cameras by optical type ─────────────────────────────────────────
     # wide        = direct-fire, no mirror → near-coplanar, reliable calibration
     # tele_fixed  = glued periscope mirror → reliable calibration R,t
-    # tele_movable= movable periscope mirror → calibration R may be stale;
-    #               use image-based alignment only, never 3D-warp
+    # tele_movable= movable periscope mirror → R computed from hall code at shot
+    #               time via compute_movable_mirror_pose() in lri_calibration.py;
+    #               det(R)=+1 confirmed, treat same as GLUED for depth warping
     wide_cams         = [n for n, c in cameras.items()
                          if c.get('mirror_type') == 'NONE' and n != ref_name]
     tele_fixed_cams   = [n for n, c in cameras.items()
@@ -853,7 +871,7 @@ def fuse_frames(frames_dir: str, cal_path: str, output_path: str) -> str:
 
     print(f"  Wide (secondary):    {sorted(wide_cams)}")
     print(f"  Tele GLUED (3D warp):{sorted(tele_fixed_cams)}")
-    print(f"  Tele MOVABLE (homog):{sorted(tele_movable_cams)}")
+    print(f"  Tele MOVABLE (hall R):{sorted(tele_movable_cams)}")
 
     # ── Wide cameras (secondary): coplanar, near-identity rotation ───────────
     # LightGlue alignment (exposure-invariant).  Secondary wide cameras blend
@@ -888,10 +906,10 @@ def fuse_frames(frames_dir: str, cal_path: str, output_path: str) -> str:
         print(f"ok (consist={consist[cov_px].mean():.2f})")
 
     # ── Telephoto cameras ─────────────────────────────────────────────────────
-    # GLUED mirror: stable calibration → 3D-warp via depth map when available.
-    # MOVABLE mirror: stale calibration → LightGlue homography only.
-    # Both are gated on sharpness (must be ≥ 0.95× reference in coverage area)
-    # and consistency (must match reference well after normalization).
+    # GLUED mirror: calibration R from factory → 3D-warp via depth map when available.
+    # MOVABLE mirror: calibration R computed from hall code at shot time via
+    #   compute_movable_mirror_pose() → det(R)=+1, same treatment as GLUED.
+    # Both are gated on sharpness and consistency.
     def _fuse_tele(cam, use_depth):
         path = os.path.join(frames_dir, f'{cam}.png')
         if not os.path.exists(path):
@@ -918,12 +936,13 @@ def fuse_frames(frames_dir: str, cal_path: str, output_path: str) -> str:
             print(f"skip (consist={mean_consist:.2f} < 0.40)")
             return
         # Sharpness gate:
-        # - For MOVABLE mirror (homography): telephoto must be ≥ 0.95× reference
-        #   sharpness — same resolution class, so this filters out-of-focus frames.
-        # - For GLUED mirror (3D warp): depth_reproject_warp downsamples the tele
-        #   camera by (fx_tele/fx_wide) into the reference frame, so the warped
-        #   image will always appear blurrier.  Skip the strict 0.95 gate; instead
-        #   allow it through (to coarse pyramid levels) as long as it's consistent.
+        # - 3D-warp path (use_depth=True, GLUED and MOVABLE w/ depth map):
+        #   depth_reproject_warp downsamples the tele camera by (fx_tele/fx_wide)
+        #   into the reference frame, so warped image always appears blurrier.
+        #   Accept if not extremely blurry (ratio ≥ 0.10).
+        # - Homography path (use_depth=False, no depth map available):
+        #   telephoto must be ≥ 0.95× reference sharpness — same resolution
+        #   class as the tele reference, strict gate filters out-of-focus frames.
         ref_sharp_cov = ref_sharp[cov_px].mean()
         cam_sharp_cov = sharp[cov_px].mean()
         sharp_ratio   = cam_sharp_cov / max(ref_sharp_cov, 1e-9)
@@ -948,13 +967,12 @@ def fuse_frames(frames_dir: str, cal_path: str, output_path: str) -> str:
         frames_list.append(warped)
         weights_list.append(w)
         coverage_list.append((mask * consist).clip(0, 1))
-        # Both GLUED (3D-warp) and MOVABLE (homography) telephoto cameras contribute
-        # at coarse pyramid levels only (≥ COARSE_FIRST = level 3, i.e. 8px+ features).
-        # - GLUED/3D-warp: downsampled to ref frame, fine-level contribution adds blur.
-        # - MOVABLE/homography: LightGlue homography is never sub-pixel accurate enough
-        #   for fine-level fusion with a telephoto that has a different optical path;
-        #   even small misalignments visually smear detail at fine scales.
-        # Both camera types still contribute colour / tone corrections at coarse scales.
+        # Both GLUED and MOVABLE telephoto cameras contribute at coarse pyramid
+        # levels only (≥ COARSE_FIRST = level 3, i.e. 8px+ features).
+        # depth_reproject_warp downsamples the tele into the wide reference frame,
+        # so warped tele detail is always coarser than the reference — fine-level
+        # blending adds blur rather than sharpness.  Coarse-level contribution
+        # still improves colour, tone, and coverage at large scales.
         first_levels.append(COARSE_FIRST)
         print(f"ok (consist={mean_consist:.2f}, sharp_ratio={sharp_ratio:.2f})")
 
@@ -962,9 +980,9 @@ def fuse_frames(frames_dir: str, cal_path: str, output_path: str) -> str:
     for cam in sorted(tele_fixed_cams):
         _fuse_tele(cam, use_depth=(depth_map is not None))
 
-    print("\n--- Telephoto MOVABLE (homography only — calibration unreliable) ---")
+    print("\n--- Telephoto MOVABLE (hall-code R — same path as GLUED) ---")
     for cam in sorted(tele_movable_cams):
-        _fuse_tele(cam, use_depth=False)
+        _fuse_tele(cam, use_depth=(depth_map is not None))
 
     # ── Smooth-fill secondary frames with reference before pyramid blend ──────
     # Zero-padded regions in secondary frames create hard edges that spike into
