@@ -208,6 +208,77 @@ def build_reprojection_grid(
 
 
 # ── NCC patch cost ────────────────────────────────────────────────────────────
+# Row-chunk size for NCC evaluation. 128 rows × 5224 cols × 147 floats × 2B ≈ 195 MB
+# per chunk (fp16), keeping peak well below 1 GB for scale 2.
+_NCC_CHUNK_ROWS = 128
+
+
+def _ncc_cost_chunk(
+    virt_padded: torch.Tensor,  # (1, C, H_v+2p, W_v+2p) — full padded virt image
+    src_padded: torch.Tensor,   # (1, C, H_v+2p, W_v+2p) — full padded sampled src
+    row_start: int,
+    row_end: int,
+    pw: int,
+    C: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Evaluate NCC for rows [row_start, row_end) of the unpadded canvas.
+    Uses fp16 patch arithmetic to keep the patch-volume footprint small.
+    Returns (chunk_H, W_v) float32 cost.
+    """
+    pad = pw // 2
+    # Slice the padded rows needed for this chunk (include top/bottom halo for unfold).
+    # Column dimension keeps all W_v + 2p columns so unfold(3) works correctly.
+    virt_sl = virt_padded[:, :, row_start: row_end + 2 * pad, :]   # (1, C, chunk_H+2p, W_v+2p)
+    src_sl  = src_padded[:, :, row_start: row_end + 2 * pad, :]
+
+    # Cast to fp16 for memory-efficient patch math (~2× smaller than fp32)
+    virt_sl = virt_sl.half()
+    src_sl  = src_sl.half()
+
+    chunk_H = row_end - row_start
+
+    def extract_patches(x: torch.Tensor) -> torch.Tensor:
+        # x: (1, C, chunk_H+2p, W_v+2p)
+        # unfold(2, pw, 1) → dim-2 size = (chunk_H+2p - pw)/1 + 1 = chunk_H
+        # unfold(3, pw, 1) → dim-3 size = (W_v+2p - pw)/1 + 1   = W_v
+        # result: (1, C, chunk_H, W_v, pw, pw)
+        x_uf = x.unfold(2, pw, 1).unfold(3, pw, 1)
+        _B, _C, cH, cW, _p1, _p2 = x_uf.shape
+        return x_uf.reshape(1, C * pw * pw, cH, cW)   # (1, P, chunk_H, W_v)
+
+    p_v = extract_patches(virt_sl)   # (1, P, chunk_H, W_v)
+    p_s = extract_patches(src_sl)
+
+    mean_v = p_v.mean(dim=1, keepdim=True)
+    mean_s = p_s.mean(dim=1, keepdim=True)
+    pv0 = p_v - mean_v
+    ps0 = p_s - mean_s
+    del p_v, p_s, mean_v, mean_s
+
+    std_v = (pv0.pow(2).mean(dim=1)).sqrt()   # (1, chunk_H, W_v)
+    std_s = (ps0.pow(2).mean(dim=1)).sqrt()
+    num   = (pv0 * ps0).mean(dim=1)           # (1, chunk_H, W_v)
+    del pv0, ps0
+
+    denom = std_v * std_s
+    valid = (denom > 1e-4).squeeze(0)         # (chunk_H, W_v)
+
+    # Promote to fp32 for the division to avoid fp16 underflow/overflow
+    # num/denom shape after squeeze: (chunk_H, W_v)
+    num_f   = num.squeeze(0).float()    # (chunk_H, W_v)
+    denom_f = denom.squeeze(0).float()  # (chunk_H, W_v)
+    del num, denom, std_v, std_s
+
+    ncc = torch.zeros_like(num_f)   # (chunk_H, W_v) float32, already on correct device
+    ncc[valid] = (num_f[valid] / denom_f[valid]).clamp(-1.0, 1.0)
+
+    cost = (1.0 - ncc) * 0.5
+    cost[~valid] = 1.0
+    return cost  # (chunk_H, W_v) float32
+
+
 def compute_ncc_cost(
     img_virt: torch.Tensor,    # (1, C, H_v, W_v) — virtual camera image
     img_src: torch.Tensor,     # (1, C, H_s, W_s) — source camera image
@@ -218,62 +289,45 @@ def compute_ncc_cost(
     Compute per-pixel NCC cost between virtual camera patches and reprojected
     source camera patches.  Returns (H_v, W_v) cost in [0, 1]; 0=perfect match,
     1=worst.  Pixels where std < 1e-4 are penalised with cost=1.
+
+    Memory strategy: sample the full grid at fp32, pad once, then evaluate NCC
+    in _NCC_CHUNK_ROWS-row strips using fp16 patch arithmetic.  This keeps the
+    peak patch-volume allocation to ~200 MB at scale 2 instead of ~12 GB.
     """
     device = img_virt.device
-    dtype = img_virt.dtype
     _, C, H_v, W_v = img_virt.shape
+    pw = 2 * patch_half + 1
+    pad = patch_half
 
-    # Sample source image at reprojected coordinates
-    # grid_sample bilinear, zero-padding for out-of-bounds
+    # Sample source image at reprojected coordinates (fp32, full resolution)
     sampled = F.grid_sample(
         img_src, grid, mode='bilinear', padding_mode='zeros', align_corners=True
     )  # (1, C, H_v, W_v)
 
-    # Extract patches via unfold — works on CPU and MPS
-    pw = 2 * patch_half + 1   # patch width
+    # Pad once so chunks can slice row halos without re-padding.
+    # Both H and W are padded; chunk slicing only touches the row dimension.
+    virt_padded = F.pad(img_virt, (pad, pad, pad, pad), mode='reflect')   # (1, C, H+2p, W+2p)
+    src_padded  = F.pad(sampled,  (pad, pad, pad, pad), mode='reflect')
+    del sampled
 
-    # Pad then unfold to get (1, C, H_v, W_v, pw, pw) patch windows
-    pad = patch_half
-    virt_padded = F.pad(img_virt, (pad, pad, pad, pad), mode='reflect')
-    src_padded = F.pad(sampled, (pad, pad, pad, pad), mode='reflect')
+    cost_rows = []
+    for row_start in range(0, H_v, _NCC_CHUNK_ROWS):
+        row_end = min(row_start + _NCC_CHUNK_ROWS, H_v)
+        chunk_cost = _ncc_cost_chunk(
+            virt_padded, src_padded,
+            row_start, row_end,
+            pw, C, device,
+        )
+        cost_rows.append(chunk_cost)
+        # Return chunk intermediates to MPS pool immediately
+        if device.type == 'mps':
+            torch.mps.empty_cache()
 
-    # unfold: (1, C, H_v, W_v, pw*pw)
-    def extract_patches(x):
-        # x: (1, C, H, W) → (1, C, H_v, pw, W_v, pw) → (1, C, H_v, W_v, pw*pw)
-        B, Cv, Hx, Wx = x.shape
-        x_uf = x.unfold(2, pw, 1).unfold(3, pw, 1)  # (B, C, H_v, W_v, pw, pw)
-        return x_uf.reshape(B, Cv, H_v, W_v, pw * pw)
+    del virt_padded, src_padded
+    if device.type == 'mps':
+        torch.mps.empty_cache()
 
-    p_virt = extract_patches(virt_padded)   # (1, C, H_v, W_v, pw²)
-    p_src  = extract_patches(src_padded)    # (1, C, H_v, W_v, pw²)
-
-    # Flatten channel and patch dims → (1, C*pw², H_v, W_v)
-    # then compute NCC across the combined axis
-    p_v = p_virt.reshape(1, C * pw * pw, H_v, W_v)   # (1, P, H_v, W_v)
-    p_s = p_src.reshape(1, C * pw * pw, H_v, W_v)
-
-    # Zero-mean and normalise across P axis
-    mean_v = p_v.mean(dim=1, keepdim=True)
-    mean_s = p_s.mean(dim=1, keepdim=True)
-    pv0 = p_v - mean_v
-    ps0 = p_s - mean_s
-
-    std_v = (pv0.pow(2).mean(dim=1)).sqrt()       # (1, H_v, W_v)
-    std_s = (ps0.pow(2).mean(dim=1)).sqrt()       # (1, H_v, W_v)
-
-    num = (pv0 * ps0).mean(dim=1)                 # (1, H_v, W_v)
-    denom = std_v * std_s                         # (1, H_v, W_v)
-
-    # Low-texture / out-of-bounds → cost=1
-    valid = (denom > 1e-4).squeeze(0)             # (H_v, W_v)
-    ncc = torch.zeros(H_v, W_v, device=device, dtype=dtype)
-    ncc[valid] = (num.squeeze(0)[valid] / denom.squeeze(0)[valid]).clamp(-1.0, 1.0)
-
-    # Convert NCC ∈ [-1,1] to cost ∈ [0,1]: cost = (1 - NCC) / 2
-    cost = (1.0 - ncc) * 0.5
-    # Pixels with low texture → maximum cost
-    cost[~valid] = 1.0
-    return cost  # (H_v, W_v)
+    return torch.cat(cost_rows, dim=0)  # (H_v, W_v) float32
 
 
 # ── Aggregate NCC over all source cameras ────────────────────────────────────
@@ -355,10 +409,6 @@ def run_patchmatch(
         rng = torch.Generator(device=device)
         depth = torch.rand(H_v, W_v, generator=rng, device=device, dtype=dtype)
         depth = depth * (depth_max - depth_min) + depth_min  # (H_v, W_v)
-
-    # Fronto-parallel normals (z > 0); correct for far-field/planar scenes
-    normals = torch.zeros(H_v, W_v, 3, device=device, dtype=dtype)
-    normals[..., 2] = 1.0   # [0, 0, 1]
 
     # Evaluate initial cost
     cost = aggregate_cost(
@@ -444,6 +494,7 @@ def propagation_pass(
         # Only evaluate on checkerboard pixels to save compute
         hyp_depth = depth.clone()
         hyp_depth[mask] = neigh_depth[mask]
+        del neigh_depth
 
         hyp_cost = aggregate_cost(
             hyp_depth, img_virt, src_imgs,
@@ -454,6 +505,9 @@ def propagation_pass(
         improve = mask & (hyp_cost < best_cost)
         best_depth[improve] = hyp_depth[improve]
         best_cost[improve] = hyp_cost[improve]
+        del hyp_depth, hyp_cost, improve
+        if device.type == 'mps':
+            torch.mps.empty_cache()
 
     return best_depth, best_cost
 
