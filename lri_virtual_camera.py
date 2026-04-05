@@ -13,9 +13,9 @@ Defines a VirtualCamera with two modes:
 
   wide:
     - FOV   = union of all A-group cameras (28mm, fx≈3370)
-    - Pixel density = median A-camera focal length (fx≈3370, native resolution)
+    - Pixel density = median B-camera focal length (fx≈8276, telephoto resolution)
     - Position (t) = A1 translation vector (reference camera)
-    Yields a 28mm-equivalent output at native A-camera pixel density (~52MP).
+    Yields a 28mm-equivalent output at telephoto pixel density (~52-80MP).
     This is the primary mode described on Light.co's website: depth from the
     5×28mm cameras, then B cameras overlaid into the A reference frame.
 """
@@ -49,9 +49,10 @@ class VirtualCamera:
             pixel density.  Reference position = centroid of A cameras.
 
         ``'wide'``
-            fx≈3370 virtual camera at native 28mm pixel density.  FOV = union
-            of A-group cameras.  Reference position = A1 translation vector
-            (or centroid of A cameras if A1 is not available).
+            fx≈8276 virtual camera (B pixel density) over A-camera FOV (28mm).
+            FOV = union of A-group cameras.  Reference position = A1
+            translation vector (or centroid of A cameras if A1 is not
+            available).  Yields 52-80MP output.
 
     Attributes
     ----------
@@ -141,10 +142,14 @@ class VirtualCamera:
 
     def _init_wide(self, cameras: dict) -> None:
         """
-        Wide mode (28mm output):
-          FOV = union of A-group cameras.
-          Pixel density = median A-group focal length (native 28mm resolution).
+        Wide mode (28mm FOV, telephoto pixel density):
+          FOV   = union of A-group cameras (28mm coverage).
+          Pixel density = median B-group focal length (fx≈8276).
           Position = A1 translation vector, or centroid of A-group cameras.
+
+        A cameras define the field-of-view; B cameras supply the pixel
+        density that lifts the output to 52-80MP.  This matches Light's
+        published architecture: depth from 5×28mm, then 70mm images overlaid.
 
         In wide mode ALL cameras (A and B) contribute to the output.
         B cameras with MOVABLE mirrors have stale R calibration — their
@@ -154,6 +159,8 @@ class VirtualCamera:
         # A-group cameras: named A1–A5, or fx < _WIDE_FX_THRESHOLD
         a_cams = {n: c for n, c in cameras.items()
                   if n in _A_CAMERAS or c['K'][0, 0] < _WIDE_FX_THRESHOLD}
+        b_cams = {n: c for n, c in cameras.items()
+                  if n in _B_CAMERAS or c['K'][0, 0] >= _WIDE_FX_THRESHOLD}
         if not a_cams:
             raise ValueError(
                 "No A-group cameras found for wide mode "
@@ -179,11 +186,19 @@ class VirtualCamera:
         half_fov_h = max(half_fov_h_list)
         half_fov_v = max(half_fov_v_list)
 
-        # ── A-camera pixel density (native 28mm resolution) ───────────────────
-        a_fx_values = [c['K'][0, 0] for c in a_cams.values()]
-        a_fy_values = [c['K'][1, 1] for c in a_cams.values()]
-        output_fx = float(np.median(a_fx_values))
-        output_fy = float(np.median(a_fy_values))
+        # ── B-camera pixel density over A-camera FOV ─────────────────────────
+        # B cameras (fx≈8276) define pixel density; A cameras define coverage.
+        # Fallback to A-camera density if no B cameras present.
+        if b_cams:
+            b_fx_values = [c['K'][0, 0] for c in b_cams.values()]
+            b_fy_values = [c['K'][1, 1] for c in b_cams.values()]
+            output_fx = float(np.median(b_fx_values))
+            output_fy = float(np.median(b_fy_values))
+        else:
+            a_fx_values = [c['K'][0, 0] for c in a_cams.values()]
+            a_fy_values = [c['K'][1, 1] for c in a_cams.values()]
+            output_fx = float(np.median(a_fx_values))
+            output_fy = float(np.median(a_fy_values))
 
         W_out = int(round(2.0 * np.tan(half_fov_h) * output_fx))
         H_out = int(round(2.0 * np.tan(half_fov_v) * output_fy))
