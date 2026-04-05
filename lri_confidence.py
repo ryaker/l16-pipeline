@@ -100,8 +100,8 @@ def compute_confidence(
     # 2. Smooth boundary falloff
     taper = coverage_taper(coverage_mask)
 
-    # 3. Confidence = taper * res_w^6
-    confidence = taper * (res_w ** 6)
+    # 3. Confidence = taper * res_w^8
+    confidence = taper * (res_w ** 8)
 
     # 4. Zero out pixels outside coverage
     confidence[~coverage_mask] = 0.0
