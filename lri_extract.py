@@ -402,6 +402,12 @@ def extract_modules(
         else:
             bayer = unpack_10bpp(data, m['abs_data'], W, H, m['stride'])
 
+        # Subtract hardware black level — all 4 Bayer channels have black=64/1023 on L16.
+        # Without this, shadows are lifted (+6% offset) and per-channel ratios are wrong.
+        _BLACK = 64
+        _WHITE = 1023
+        bayer = np.clip(bayer.astype(np.int32) - _BLACK, 0, _WHITE - _BLACK).astype(np.uint16)
+
         if raw_bayer:
             # Save as 16-bit grayscale (no demosaic)
             ext  = '.tiff' if fmt == 'tiff' else '.png'
@@ -446,8 +452,9 @@ def _save_rgb(
         pil = PILImage.fromarray(rgb.astype(np.uint16))
         pil.save(path)
     else:
-        # 16-bit PNG: scale 10-bit [0..1023] → 16-bit [0..65535]
-        rgb16 = (rgb.astype(np.uint32) * 64).clip(0, 65535).astype(np.uint16)
+        # 16-bit PNG: scale 10-bit-after-black-subtract [0..959] → [0..65535]
+        # (1023 − black_level=64 = 959 usable steps)
+        rgb16 = (rgb.astype(np.float32) * (65535.0 / 959.0)).clip(0, 65535).astype(np.uint16)
         # cv2 expects BGR; imwrite with uint16 writes proper 16-bit PNG
         cv2.imwrite(path, cv2.cvtColor(rgb16, cv2.COLOR_RGB2BGR))
 

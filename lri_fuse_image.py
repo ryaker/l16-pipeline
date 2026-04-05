@@ -71,8 +71,91 @@ def load_cameras(cal_path: str) -> dict:
             R=np.array(cal['rotation'],    dtype=np.float64) if cal.get('rotation') else None,
             t=np.array(cal['translation'], dtype=np.float64) if cal.get('translation') else None,
             W=mod['width'], H=mod['height'],
+            mirror_type=cal.get('mirror_type', 'NONE'),
         )
     return cameras
+
+
+# ── reference camera selection ───────────────────────────────────────────────
+
+def select_reference(cameras: dict, frames_dir: str) -> str:
+    """
+    Pick the reference camera from first principles — not by name.
+
+    Rules (in order):
+      1. Only consider direct-fire cameras (mirror_type='NONE') — widest FOV,
+         no mirror, identity rotation, reliable calibration.
+      2. Among those, pick the one geometrically closest to the centroid of
+         all direct-fire camera positions.  This minimises the average warp
+         distance to every other wide camera, reducing interpolation error.
+      3. If t is missing for any camera, fall back to comparing |t| from origin.
+      4. Frame must actually exist on disk.
+
+    Returns the camera name (e.g. 'A1').
+    """
+    import glob as _glob
+
+    wide = {n: c for n, c in cameras.items()
+            if c.get('mirror_type', 'NONE') == 'NONE'
+            and c.get('t') is not None
+            and os.path.exists(os.path.join(frames_dir, f'{n}.png'))}
+
+    if not wide:
+        # Fallback: first camera with an existing frame
+        for n in cameras:
+            if os.path.exists(os.path.join(frames_dir, f'{n}.png')):
+                return n
+        raise RuntimeError('No camera frames found in ' + frames_dir)
+
+    positions = np.array([c['t'] for c in wide.values()])   # (N, 3)
+    centroid  = positions.mean(axis=0)
+    ref_name  = min(wide, key=lambda n: np.linalg.norm(wide[n]['t'] - centroid))
+    return ref_name
+
+
+def load_depth_map(lumen_dir: str, ref_name: str,
+                   target_hw: tuple) -> np.ndarray | None:
+    """
+    Load the best available depth map for the reference camera.
+
+    Priority:
+      1. fused_*cams_median_depth.png  — multi-camera median fusion (uint16, mm)
+      2. depth/<ref_name>.npz          — single-camera Depth Pro output (float32, m)
+
+    Returns float32 (H, W) depth in METRES, or None if nothing found.
+    target_hw : (H, W) to resize depth map to if shape differs.
+    """
+    import glob as _glob
+
+    H_ref, W_ref = target_hw
+
+    # Priority 1: fused multi-camera depth PNG (mm uint16)
+    fused_candidates = sorted(_glob.glob(
+        os.path.join(lumen_dir, 'fused_*cams_median_depth.png')))
+    if fused_candidates:
+        path = fused_candidates[-1]   # highest cam count if multiple
+        d = cv2.imread(path, cv2.IMREAD_ANYDEPTH)
+        if d is not None:
+            d = d.astype(np.float32) / 1000.0     # mm → metres
+            if d.shape != (H_ref, W_ref):
+                d = cv2.resize(d, (W_ref, H_ref), interpolation=cv2.INTER_LINEAR)
+            print(f"  Depth map: {os.path.basename(path)} "
+                  f"({d[d>0].min():.1f}–{d[d>0].max():.1f}m, "
+                  f"{100*(d>0).mean():.0f}% valid)")
+            return d
+
+    # Priority 2: single-camera Depth Pro .npz
+    npz_path = os.path.join(lumen_dir, 'depth', f'{ref_name}.npz')
+    if os.path.exists(npz_path):
+        d = np.load(npz_path)['depth'].astype(np.float32)
+        if d.shape != (H_ref, W_ref):
+            d = cv2.resize(d, (W_ref, H_ref), interpolation=cv2.INTER_LINEAR)
+        print(f"  Depth map: depth/{ref_name}.npz "
+              f"({d[d>0].min():.1f}–{d[d>0].max():.1f}m)")
+        return d
+
+    print('  No depth map found — homography fallback for telephoto cameras')
+    return None
 
 
 # ── image I/O ────────────────────────────────────────────────────────────────
@@ -127,7 +210,7 @@ def coverage_mask(H: np.ndarray,
 # ── consistency weight ───────────────────────────────────────────────────────
 
 def consistency_weight(ref: np.ndarray, warped: np.ndarray,
-                       sigma: float = 2000.0) -> np.ndarray:
+                       sigma: float = 5000.0) -> np.ndarray:
     """
     Per-pixel weight: how well does `warped` match `ref`?
 
@@ -136,7 +219,9 @@ def consistency_weight(ref: np.ndarray, warped: np.ndarray,
     misregistration).  When a pixel's weight is low the accumulator falls back
     to the A1 reference which already has full weight there.
 
-    sigma controls the tolerance: 2000 ≈ 3% of the 16-bit range (strict).
+    sigma controls the tolerance: 5000 ≈ 7.6% of the 16-bit range.  A telephoto
+    camera warped via depth map typically has ~3000-3500 mean diff from sub-pixel
+    depth errors (≈5% of 16-bit); sigma=5000 gives consist≈0.50 for those.
 
     Overexposure suppression: pixels where ref is near-saturated (>85% of
     65535) get progressively zeroed out.  Overexposed glass/sky regions have
@@ -145,9 +230,17 @@ def consistency_weight(ref: np.ndarray, warped: np.ndarray,
     cleaner than a ghost blend of badly-matched frames.
     """
     # ── alignment consistency ─────────────────────────────────────────────────
+    # Zero-out diff where warped has no content (black-filled outside coverage).
+    # Without this, the huge diff at zero-padding edges bleeds through the
+    # Gaussian blur into the coverage area, making consistency look near-zero
+    # even when the alignment inside coverage is actually good.
+    valid_warp = (warped.astype(np.float32).max(axis=2) > 0).astype(np.float32)
     diff = np.abs(warped.astype(np.float32) - ref.astype(np.float32)).mean(axis=2)
+    diff = diff * valid_warp   # zero outside coverage before blurring
     diff = cv2.GaussianBlur(diff, (31, 31), 10.0)
     w = np.exp(-diff / sigma)
+    # Also zero consistency outside coverage so the gate tests only real content
+    w = w * valid_warp
 
     # ── overexposure mask ─────────────────────────────────────────────────────
     # ramp: 1.0 at ≤85% sat, 0.0 at ≥95% sat  (linear ramp over 10% window)
@@ -161,28 +254,27 @@ def consistency_weight(ref: np.ndarray, warped: np.ndarray,
 
 # ── sharpness weight ─────────────────────────────────────────────────────────
 
-def laplacian_pyramid_blend(frames: list, weights: list, levels: int = 6) -> np.ndarray:
+def laplacian_pyramid_blend(frames: list, weights: list, levels: int = 6,
+                            first_levels: list | None = None) -> np.ndarray:
     """
     Multi-scale Laplacian pyramid blend of N aligned frames.
 
-    frames  : list of float32 (H, W, 3) arrays in [0..65535] range
-    weights : list of float32 (H, W) weight maps (not normalised — raw sharpness×mask×consistency)
-    levels  : number of pyramid levels (6 = ~64px resolution at base)
+    frames       : list of float32 (H, W, 3) arrays in [0..65535] range
+    weights      : list of float32 (H, W) weight maps (raw sharpness×mask×consistency)
+    levels       : number of pyramid levels (6 = ~64px resolution at base)
+    first_levels : optional list of ints (one per frame).  Frame i only
+                   contributes at pyramid level >= first_levels[i].
+                   Use first_levels[i] = COARSE_FIRST (=3) for secondary wide
+                   cameras: they provide colour/exposure at low frequencies but
+                   their sub-pixel warp error blurs fine detail.  Fine levels
+                   (0, 1, 2) fall through to the reference camera only.
 
     Returns float32 (H, W, 3) blended image.
-
-    Why this fixes halos vs weighted-average:
-      Weighted average mixes pixel VALUES across all frames at once.  At a depth
-      edge, a sharp-foreground pixel from cam A and a blurred-background pixel
-      from cam B get averaged — producing a half-sharp, half-blurred ghost.
-      Laplacian pyramid blending separates low-frequency content (base colour,
-      gradual tone) from high-frequency content (edges, texture) and blends them
-      independently at each spatial scale.  The edge detail from the sharpest
-      camera dominates at fine scales; colour and brightness average naturally
-      at coarse scales.  No halos.
     """
     N = len(frames)
     assert N == len(weights) and N > 0
+    if first_levels is None:
+        first_levels = [0] * N
 
     H, W = frames[0].shape[:2]
 
@@ -214,8 +306,13 @@ def laplacian_pyramid_blend(frames: list, weights: list, levels: int = 6) -> np.
     # ── Blend each pyramid level ───────────────────────────────────────────────
     blended_pyr = []
     for l in range(levels):
-        # Stack weight maps at this level and normalise so they sum to 1
-        w_stack = np.stack([gp_weights[i][l] for i in range(N)], axis=0)   # (N, H_l, W_l)  # gp_weights[i][l] — level-matched weight pyramid (correct)
+        # Stack weight maps at this level; zero out frames that don't contribute
+        # at this pyramid level (first_levels gating for secondary wide cameras).
+        w_stack = np.stack([
+            gp_weights[i][l] if l >= first_levels[i]
+            else np.zeros_like(gp_weights[i][l])
+            for i in range(N)
+        ], axis=0)   # (N, H_l, W_l)
         w_sum   = w_stack.sum(axis=0, keepdims=True).clip(min=1e-6)
         w_norm  = w_stack / w_sum                                            # (N, H_l, W_l)
 
@@ -265,14 +362,25 @@ def _get_raft():
     return _raft_model
 
 
-def _img_to_raft_tensor(img_float32: np.ndarray) -> torch.Tensor:
+def _img_to_raft_tensor(img_float32: np.ndarray,
+                        scale: float | None = None) -> tuple:
     """
-    float32 (H, W, 3) [0..65535] → float32 tensor (1, 3, H, W) [0..255] for RAFT.
-    RAFT expects float32 images in [0, 255].
+    float32 (H, W, 3) [0..65535] → (tensor (1, 3, H, W) [0..255], scale_factor).
+    RAFT expects float32 images in [0, 255], trained on normally-exposed photos.
+    Raw L16 frames are very dark (mean ~5000/65535 = 7.6% brightness), so a naive
+    /257 rescale gives mean ~19/255 — too dark for reliable optical flow.
+    Stretch to bring the 99th-percentile brightness to ~200/255.
+    Pass scale from the reference image when converting the source so both images
+    use the same linear stretch — RAFT needs relative brightness preserved.
+    Returns (tensor, scale_used).
     """
-    arr = (img_float32 / 257.0).clip(0.0, 255.0).astype(np.float32)
-    t   = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
-    return t
+    arr = img_float32 / 257.0
+    if scale is None:
+        p99 = float(np.percentile(arr, 99))
+        scale = 200.0 / max(p99, 1.0)
+    arr = np.clip(arr * scale, 0.0, 255.0)
+    t = torch.from_numpy(arr.astype(np.float32)).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
+    return t, scale
 
 
 def warp_flow(src: np.ndarray, flow: np.ndarray) -> np.ndarray:
@@ -313,8 +421,8 @@ def align_raft(ref: np.ndarray, src: np.ndarray) -> tuple:
     src_s = cv2.resize(src, (W_s, H_s), interpolation=cv2.INTER_AREA)
 
     raft  = _get_raft()
-    t_ref = _img_to_raft_tensor(ref_s)
-    t_src = _img_to_raft_tensor(src_s)
+    t_ref, scale = _img_to_raft_tensor(ref_s)           # compute scale from ref
+    t_src, _     = _img_to_raft_tensor(src_s, scale)    # apply same scale to src
 
     with torch.no_grad():
         flow_list = raft(t_ref, t_src)
@@ -377,7 +485,8 @@ def depth_reproject_warp(ref: np.ndarray, src: np.ndarray,
     K_A = cam_a1['K']
     K_B = cam_b['K']
     R   = cam_b['R']
-    t   = cam_b['t'].reshape(3)
+    # Calibration t is in millimetres; depth_map is in metres — convert to metres
+    t   = cam_b['t'].reshape(3) / 1000.0
 
     # Build pixel coordinate grid for A1
     cols, rows = np.meshgrid(np.arange(W, dtype=np.float64),
@@ -418,14 +527,40 @@ def depth_reproject_warp(ref: np.ndarray, src: np.ndarray,
     return warped.astype(np.float32), cov.astype(np.float32)
 
 
+def _homography_maps_within(H: np.ndarray, src_hw: tuple, dst_hw: tuple,
+                            margin: float = 0.5) -> bool:
+    """
+    Return True if H maps the center of src to within the dst frame
+    (±margin × dst_dimension tolerance).
+
+    Used to detect when a calibration homography has gone wildly off-screen,
+    which happens for MOVABLE mirror B cameras whose rotation matrices don't
+    directly feed a simple rotation-only homography.
+    """
+    sh, sw = src_hw
+    dh, dw = dst_hw
+    pt = H @ np.array([sw / 2.0, sh / 2.0, 1.0])
+    if abs(pt[2]) < 1e-8:
+        return False
+    x, y = pt[0] / pt[2], pt[1] / pt[2]
+    return ((-margin * dw) < x < ((1 + margin) * dw) and
+            (-margin * dh) < y < ((1 + margin) * dh))
+
+
 def align_b_camera(ref: np.ndarray, src: np.ndarray,
                    cam_ref: dict, cam_src: dict,
                    depth_map: np.ndarray | None = None) -> tuple:
     """
     Align a B-group src frame to A1 ref using:
-      1. Calibration homography (initial estimate)
-      2. SuperPoint + LightGlue feature refinement (improves accuracy)
-      3. Perspective warp to A1 canvas
+      1. Calibration homography (initial estimate) — used only when it maps
+         src pixels into a sensible region of ref (i.e., GLUED mirror cameras).
+         For MOVABLE mirror cameras the calibration rotation maps completely
+         off-screen, so we skip the pre-warp and go straight to step 2.
+      2. SuperPoint + LightGlue feature matching on the (possibly pre-warped)
+         src image.  When the calibration pre-warp is skipped, LightGlue
+         matches directly from raw src space to ref space and returns the full
+         homography.
+      3. Perspective warp to A1 canvas.
 
     If depth_map is provided (float32 H×W, metres, co-registered with ref),
     uses depth_reproject_warp() instead for a true 3D warp that correctly
@@ -445,35 +580,86 @@ def align_b_camera(ref: np.ndarray, src: np.ndarray,
     # ── Step 1: calibration homography ───────────────────────────────────────
     H_cal = homography_from_calibration(cam_ref, cam_src)
 
-    # ── Step 2: warp src to ref space with initial homography ────────────────
-    if H_cal is not None:
-        src_pre = cv2.warpPerspective(src, H_cal, (W_ref, H_ref),
-                                      flags=cv2.INTER_LINEAR,
-                                      borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        H_total = H_cal.copy()
-    else:
-        src_pre = src.copy()
-        H_total = np.eye(3, dtype=np.float64)
+    # Check whether H_cal actually maps src content into ref's neighbourhood.
+    # GLUED mirror B cameras (e.g. B4) have near-identity rotations → valid.
+    # MOVABLE mirror B cameras have large optical-axis offsets → H_cal maps
+    # the src center thousands of pixels outside ref → useless pre-warp.
+    cal_valid = (H_cal is not None and
+                 _homography_maps_within(H_cal, (H_src, W_src), (H_ref, W_ref),
+                                         margin=0.5))
 
-    # ── Step 3: LightGlue refinement ─────────────────────────────────────────
+    # ── Step 2 + 3: align via LightGlue ──────────────────────────────────────
     try:
-        H_refined = _lightglue_refine(ref, src_pre)
-        if H_refined is not None:
-            warped  = cv2.warpPerspective(src_pre, H_refined, (W_ref, H_ref),
+        if cal_valid:
+            # Pre-warp with calibration, then refine residual with LightGlue
+            src_pre = cv2.warpPerspective(src, H_cal, (W_ref, H_ref),
                                           flags=cv2.INTER_LINEAR,
                                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-            H_total = H_refined @ H_total
+            H_total = H_cal.copy()
+            H_refined = _lightglue_refine(ref, src_pre)
+            if H_refined is not None:
+                warped  = cv2.warpPerspective(src_pre, H_refined, (W_ref, H_ref),
+                                              flags=cv2.INTER_LINEAR,
+                                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                H_total = H_refined @ H_total
+            else:
+                print("    (LightGlue returned no matches, using cal-only warp)")
+                warped = src_pre
         else:
-            warped = src_pre
+            # Calibration pre-warp is invalid (MOVABLE mirror camera).
+            # The B camera has a much higher focal length than A1 (typically 2-3×),
+            # so direct full-resolution matching fails because features appear at
+            # very different scales.  Strategy:
+            #   1. Try LightGlue on raw src (works if scale difference is small).
+            #   2. If that fails, resize src to A1's effective scale (fx_ref/fx_src)
+            #      so both images show the same feature sizes.  The homography
+            #      H_scaled (scaled_src → ref) is then adjusted back to raw src
+            #      space: H_total = H_scaled @ S  where S = diag(scale, scale, 1).
+            reason = "no cal" if H_cal is None else "cal maps off-screen"
+            print(f"    ({reason} — LightGlue on raw src)", end=' ', flush=True)
+            H_lg = _lightglue_refine(ref, src)
+            if H_lg is not None:
+                warped  = cv2.warpPerspective(src, H_lg, (W_ref, H_ref),
+                                              flags=cv2.INTER_LINEAR,
+                                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                H_total = H_lg
+            else:
+                # Raw-src match failed — try scale-normalised matching.
+                # Rescale src to approximately A1's resolution of the same scene area.
+                fx_ref = cam_ref['K'][0, 0] if cam_ref is not None else None
+                fx_src = cam_src['K'][0, 0] if cam_src is not None else None
+                scale  = (fx_ref / fx_src) if (fx_ref and fx_src and fx_src > fx_ref) else None
+                if scale is not None and scale < 0.95:
+                    sw_scaled = max(64, int(W_src * scale))
+                    sh_scaled = max(64, int(H_src * scale))
+                    src_scaled = cv2.resize(src, (sw_scaled, sh_scaled),
+                                            interpolation=cv2.INTER_AREA)
+                    print(f"    (scale-norm {scale:.3f} → {sw_scaled}×{sh_scaled})", end=' ', flush=True)
+                    H_scaled = _lightglue_refine(ref, src_scaled)
+                    if H_scaled is not None:
+                        # Map: raw_src →[S]→ scaled_src →[H_scaled]→ ref
+                        S = np.diag([scale, scale, 1.0])
+                        H_total = H_scaled @ S
+                        warped  = cv2.warpPerspective(src, H_total, (W_ref, H_ref),
+                                                      flags=cv2.INTER_LINEAR,
+                                                      borderMode=cv2.BORDER_CONSTANT,
+                                                      borderValue=0)
+                    else:
+                        print("    LightGlue found no matches — camera skipped")
+                        blank = np.zeros_like(ref, dtype=np.float32)
+                        return blank, np.zeros((H_ref, W_ref), dtype=np.float32)
+                else:
+                    print("    LightGlue found no matches — camera skipped")
+                    blank = np.zeros_like(ref, dtype=np.float32)
+                    return blank, np.zeros((H_ref, W_ref), dtype=np.float32)
+
     except Exception as e:
-        print(f"    LightGlue failed ({e}), using calibration-only warp")
-        warped = src_pre
+        print(f"    LightGlue failed ({e}), skipping camera")
+        blank = np.zeros_like(ref, dtype=np.float32)
+        return blank, np.zeros((H_ref, W_ref), dtype=np.float32)
 
     # Coverage mask: which output pixels came from valid src sensor coordinates.
-    # Warping a src-shaped ones-mask through H_total gives exactly this region.
-    # A telephoto B-camera only covers the center of A1; the mask goes to zero
-    # outside that region, preventing ceiling/corner artifacts.
-    cov = coverage_mask(H_total, (H_src, W_src), (H_ref, W_ref), feather_px=60)
+    cov = coverage_mask(H_total, (H_src, W_src), (H_ref, W_ref), feather_px=150)
     return warped, cov
 
 
@@ -571,9 +757,11 @@ def radiometric_normalize(src: np.ndarray, ref: np.ndarray,
         b_vec = np.array([wsr, wr])
         try:
             g, b = np.linalg.solve(A, b_vec)
-            # Sanity clamp: gain should be near 1.0
-            g = float(np.clip(g, 0.5, 2.0))
-            b = float(np.clip(b, -5000, 5000))
+            # Sanity clamp: gain in valid range; bias limited to ±20% of 16-bit range
+            # (A cameras with 3.5× exposure difference can have large negative bias if
+            # saturated highlights skew the regression — clamping bias prevents dark-level clipping)
+            g = float(np.clip(g, 0.05, 20.0))
+            b = float(np.clip(b, -13107.0, 13107.0))   # ±20% of 65535
             result[:, :, c] = np.clip(g * src[:, :, c] + b, 0, 65535)
         except np.linalg.LinAlgError:
             pass  # singular — skip normalization for this channel
@@ -609,8 +797,11 @@ def apply_ccm(src: np.ndarray, ccm: np.ndarray) -> np.ndarray:
 
 # ── core fusion ──────────────────────────────────────────────────────────────
 
-A_CAMS = ['A1', 'A2', 'A3', 'A4', 'A5']
-B_CAMS = ['B1', 'B2', 'B3', 'B4', 'B5']
+# Finest pyramid level at which secondary wide cameras contribute.
+# Levels 0-(COARSE_FIRST-1) are fine detail — secondary wide cameras are
+# excluded because sub-pixel warp error blurs them.  Levels COARSE_FIRST+ are
+# colour/exposure — all cameras contribute.
+COARSE_FIRST = 3
 
 
 def fuse_frames(frames_dir: str, cal_path: str, output_path: str) -> str:
@@ -630,81 +821,166 @@ def fuse_frames(frames_dir: str, cal_path: str, output_path: str) -> str:
 
     cameras = load_cameras(cal_path)
 
-    # ── Load A1 reference ─────────────────────────────────────────────────────
-    a1_path = os.path.join(frames_dir, 'A1.png')
-    ref = load_frame_uint16(a1_path)
+    # ── Select reference camera from geometry, not label ─────────────────────
+    ref_name = select_reference(cameras, frames_dir)
+    ref_path = os.path.join(frames_dir, f'{ref_name}.png')
+    ref = load_frame_uint16(ref_path)
     H_ref, W_ref = ref.shape[:2]
-    print(f"  A1 reference: {W_ref}×{H_ref}")
+    cam_ref = cameras[ref_name]
+    print(f"  Reference: {ref_name}  ({W_ref}×{H_ref}  mirror={cam_ref['mirror_type']})")
 
-    frames_list  = [ref.astype(np.float32)]
-    weights_list = [sharpness_weight(ref).astype(np.float32)]
+    # ── Load depth map ────────────────────────────────────────────────────────
+    lumen_dir  = os.path.dirname(frames_dir.rstrip('/'))
+    depth_map  = load_depth_map(lumen_dir, ref_name, (H_ref, W_ref))
 
-    # ── A-group: RAFT flow alignment ─────────────────────────────────────────
-    print("\n--- A-group (RAFT optical flow) ---")
-    for cam in ['A2', 'A3', 'A4', 'A5']:
+    ref_sharp     = sharpness_weight(ref).astype(np.float32)
+    frames_list   = [ref.astype(np.float32)]
+    weights_list  = [ref_sharp]
+    coverage_list = [np.ones((H_ref, W_ref), dtype=np.float32)]
+    first_levels  = [0]   # reference contributes at all pyramid levels
+
+    # ── Group cameras by optical type ─────────────────────────────────────────
+    # wide        = direct-fire, no mirror → near-coplanar, reliable calibration
+    # tele_fixed  = glued periscope mirror → reliable calibration R,t
+    # tele_movable= movable periscope mirror → calibration R may be stale;
+    #               use image-based alignment only, never 3D-warp
+    wide_cams         = [n for n, c in cameras.items()
+                         if c.get('mirror_type') == 'NONE' and n != ref_name]
+    tele_fixed_cams   = [n for n, c in cameras.items()
+                         if c.get('mirror_type') == 'GLUED']
+    tele_movable_cams = [n for n, c in cameras.items()
+                         if c.get('mirror_type') == 'MOVABLE']
+
+    print(f"  Wide (secondary):    {sorted(wide_cams)}")
+    print(f"  Tele GLUED (3D warp):{sorted(tele_fixed_cams)}")
+    print(f"  Tele MOVABLE (homog):{sorted(tele_movable_cams)}")
+
+    # ── Wide cameras (secondary): coplanar, near-identity rotation ───────────
+    # LightGlue alignment (exposure-invariant).  Secondary wide cameras blend
+    # at coarse pyramid levels only (first_level=COARSE_FIRST) — their fine-
+    # scale detail is identical to the reference but shifted by sub-pixel warp
+    # error, causing blur if blended at full resolution.
+    print(f"\n--- Wide cameras (secondary, coarse-blend only above level {COARSE_FIRST}) ---")
+    for cam in sorted(wide_cams):
         path = os.path.join(frames_dir, f'{cam}.png')
         if not os.path.exists(path):
             print(f"  {cam}: missing, skip")
             continue
         print(f"  {cam} ...", end=' ', flush=True)
-        src          = load_frame_uint16(path)
-        warped, mask = align_raft(ref, src)
-        warped = radiometric_normalize(warped.astype(np.float32), ref.astype(np.float32), mask)
-        sharp        = sharpness_weight(warped).astype(np.float32)
-        consist      = consistency_weight(ref, warped).astype(np.float32)
-        w            = sharp * mask.astype(np.float32) * consist
-        frames_list.append(warped.astype(np.float32))
+        src = load_frame_uint16(path)
+        if (src >= 65530).mean() > 0.40:
+            print(f"skip (>40% saturated)")
+            continue
+        cam_x = cameras[cam]
+        warped, mask = align_b_camera(ref, src, cam_ref, cam_x)
+        warped   = radiometric_normalize(warped, ref.astype(np.float32), mask)
+        consist  = consistency_weight(ref, warped).astype(np.float32)
+        cov_px   = mask > 0.5
+        if cov_px.sum() > 0 and consist[cov_px].mean() < 0.40:
+            print(f"skip (consist={consist[cov_px].mean():.2f} < 0.40)")
+            continue
+        sharp = sharpness_weight(warped).astype(np.float32)
+        w     = sharp * mask * consist
+        frames_list.append(warped)
         weights_list.append(w)
-        print("done")
+        coverage_list.append((mask * consist).clip(0, 1))
+        first_levels.append(COARSE_FIRST)   # coarse-only blend
+        print(f"ok (consist={consist[cov_px].mean():.2f})")
 
-    # ── B-group: depth-map reprojection (or homography fallback) ────────────
-    # Try to load A1 depth map for B-camera reprojection.
-    # Expected path: <lumen_dir>/depth/A1.npz  (produced by Depth Pro).
-    depth_map_path = os.path.join(os.path.dirname(frames_dir.rstrip('/')),
-                                  'depth', 'A1.npz')
-    depth_map_a1 = None
-    if os.path.exists(depth_map_path):
-        depth_map_a1 = np.load(depth_map_path)['depth'].astype(np.float32)
-        # Resize to match ref frame if needed
-        if depth_map_a1.shape != (H_ref, W_ref):
-            depth_map_a1 = cv2.resize(depth_map_a1, (W_ref, H_ref),
-                                      interpolation=cv2.INTER_LINEAR)
-        print(f"  Depth map loaded: {depth_map_path}")
-    else:
-        print(f"  No depth map found, using homography fallback for B-group")
-
-    print("\n--- B-group (homography + LightGlue) ---")
-    cam_a1 = cameras.get('A1')
-    for cam in B_CAMS:
+    # ── Telephoto cameras ─────────────────────────────────────────────────────
+    # GLUED mirror: stable calibration → 3D-warp via depth map when available.
+    # MOVABLE mirror: stale calibration → LightGlue homography only.
+    # Both are gated on sharpness (must be ≥ 0.95× reference in coverage area)
+    # and consistency (must match reference well after normalization).
+    def _fuse_tele(cam, use_depth):
         path = os.path.join(frames_dir, f'{cam}.png')
         if not os.path.exists(path):
             print(f"  {cam}: missing, skip")
-            continue
-        if cam not in cameras:
-            print(f"  {cam}: no calibration, skip")
-            continue
-        print(f"  {cam} ...", end=' ', flush=True)
+            return
+        print(f"  {cam} ({'3D-warp' if use_depth else 'homog'}) ...", end=' ', flush=True)
         src   = load_frame_uint16(path)
         cam_b = cameras[cam]
-        warped, mask = align_b_camera(ref, src, cam_a1, cam_b,
-                                      depth_map=depth_map_a1)
-        warped = radiometric_normalize(warped.astype(np.float32), ref.astype(np.float32), mask)
-        # B-group CCM: correct spectral shift from periscope mirrors
-        ccm = estimate_ccm(warped, ref.astype(np.float32), mask)
+        dm    = depth_map if use_depth else None
+        warped, mask = align_b_camera(ref, src, cam_ref, cam_b, depth_map=dm)
+        warped = radiometric_normalize(warped, ref.astype(np.float32), mask)
+        ccm    = estimate_ccm(warped, ref.astype(np.float32), mask)
         if ccm is not None:
             warped = apply_ccm(warped, ccm)
-        sharp        = sharpness_weight(warped).astype(np.float32)
-        consist      = consistency_weight(ref, warped).astype(np.float32)
-        w            = sharp * mask.astype(np.float32) * consist
-        frames_list.append(warped.astype(np.float32))
+        sharp   = sharpness_weight(warped).astype(np.float32)
+        consist = consistency_weight(ref, warped).astype(np.float32)
+        cov_px  = mask > 0.5
+        if cov_px.sum() == 0:
+            print("skip (no coverage)")
+            return
+        # Consistency gate
+        mean_consist = consist[cov_px].mean()
+        if mean_consist < 0.40:
+            print(f"skip (consist={mean_consist:.2f} < 0.40)")
+            return
+        # Sharpness gate:
+        # - For MOVABLE mirror (homography): telephoto must be ≥ 0.95× reference
+        #   sharpness — same resolution class, so this filters out-of-focus frames.
+        # - For GLUED mirror (3D warp): depth_reproject_warp downsamples the tele
+        #   camera by (fx_tele/fx_wide) into the reference frame, so the warped
+        #   image will always appear blurrier.  Skip the strict 0.95 gate; instead
+        #   allow it through (to coarse pyramid levels) as long as it's consistent.
+        ref_sharp_cov = ref_sharp[cov_px].mean()
+        cam_sharp_cov = sharp[cov_px].mean()
+        sharp_ratio   = cam_sharp_cov / max(ref_sharp_cov, 1e-9)
+        if use_depth:
+            # 3D-warp path: accept if not extremely blurry (ratio ≥ 0.10)
+            if sharp_ratio < 0.10:
+                print(f"skip (sharp_ratio={sharp_ratio:.2f} — too blurry even for coarse blend)")
+                return
+        else:
+            # Homography path: strict gate — same-resolution class camera
+            if sharp_ratio < 0.95:
+                print(f"skip (sharp_ratio={sharp_ratio:.2f} — blurrier than reference)")
+                return
+        # Without depth map, block movable-mirror cameras covering the upper
+        # frame where parallax artifacts are worst
+        if dm is None:
+            ys = np.where(mask > 0.3)[0]
+            if len(ys) > 0 and ys.min() / H_ref < 0.40:
+                print(f"skip (coverage top={ys.min()/H_ref:.2f} — upper parallax, no depth)")
+                return
+        w = sharp * mask * consist
+        frames_list.append(warped)
         weights_list.append(w)
-        print("done")
+        coverage_list.append((mask * consist).clip(0, 1))
+        # Both GLUED (3D-warp) and MOVABLE (homography) telephoto cameras contribute
+        # at coarse pyramid levels only (≥ COARSE_FIRST = level 3, i.e. 8px+ features).
+        # - GLUED/3D-warp: downsampled to ref frame, fine-level contribution adds blur.
+        # - MOVABLE/homography: LightGlue homography is never sub-pixel accurate enough
+        #   for fine-level fusion with a telephoto that has a different optical path;
+        #   even small misalignments visually smear detail at fine scales.
+        # Both camera types still contribute colour / tone corrections at coarse scales.
+        first_levels.append(COARSE_FIRST)
+        print(f"ok (consist={mean_consist:.2f}, sharp_ratio={sharp_ratio:.2f})")
+
+    print("\n--- Telephoto GLUED (3D warp via depth map) ---")
+    for cam in sorted(tele_fixed_cams):
+        _fuse_tele(cam, use_depth=(depth_map is not None))
+
+    print("\n--- Telephoto MOVABLE (homography only — calibration unreliable) ---")
+    for cam in sorted(tele_movable_cams):
+        _fuse_tele(cam, use_depth=False)
+
+    # ── Smooth-fill secondary frames with reference before pyramid blend ──────
+    # Zero-padded regions in secondary frames create hard edges that spike into
+    # coarse pyramid levels as visible seams.  Fill with reference content
+    # outside coverage — the blend weight is still gated by coverage so the
+    # fill region contributes near-zero weight.
+    ref_f32 = frames_list[0]
+    for i in range(1, len(frames_list)):
+        cov_3c = coverage_list[i][:, :, np.newaxis]
+        frames_list[i] = frames_list[i] * cov_3c + ref_f32 * (1.0 - cov_3c)
 
     # ── Laplacian pyramid blend ───────────────────────────────────────────────
     print(f"\nBlending {len(frames_list)} frames with Laplacian pyramid ...", flush=True)
-    fused = laplacian_pyramid_blend(frames_list, weights_list)
+    fused = laplacian_pyramid_blend(frames_list, weights_list,
+                                    first_levels=first_levels)
 
-    # Where no camera contributed any weight, fall back to A1
     weight_sum = sum(w for w in weights_list)
     no_data = (weight_sum == 0)
     fused[no_data] = ref[no_data]

@@ -8,13 +8,26 @@ The Light L16 captured 10 simultaneous RAW frames (5 wide + 5 tele) and used com
 
 ## Working On Now
 
-### Multi-camera image fusion overhaul ✅ (just landed)
-Replaced the weighted-average accumulator in `lri_fuse_image.py` with a full multi-scale fusion pipeline:
+### v2 Synthetic Canvas Fusion (new)
+The new pipeline in `lri_fuse_v2.py` / `lri_canvas_blend.py` builds a synthetic 81MP canvas (10449×7795) from calibration geometry:
 
-- **Laplacian pyramid blending** — 6-level pyramid blends low/high frequencies independently per camera at each scale. Eliminates the halo artifacts that weighted-average produced at depth edges. Weight maps are decomposed into their own Gaussian pyramids (level-matched), which is the mathematically correct approach.
-- **Radiometric normalization** — Before blending, each camera's gain and bias are estimated against the A1 reference using WLS (Weighted Least Squares) with inverse-gradient weighting. Edges are excluded from the gain estimate so color objects don't skew the result. Applied per-channel (R/G/B independently).
-- **B-group color correction matrix** — B-group cameras use periscope mirrors that introduce spectral shifts not present in the direct-firing A-group lenses. A 3×3 CCM is estimated per B-camera (least squares over overlap pixels) and applied before blending.
-- **Depth-map reprojection for B-cameras** — When a Depth Pro depth map is available (`depth/A1.npz`), B-cameras are aligned using true 3D warp (unproject via K_A⁻¹ → transform via R/t → reproject via K_B) rather than a global homography. Correctly handles depth-dependent parallax. Falls back to homography + LightGlue if depth map is absent.
+**VirtualCamera canvas** — center at the wide-camera centroid, focal length matches B4 telephoto (fx≈8276). All cameras are remapped into this common coordinate frame.
+
+**Confidence weights** — each camera contributes `taper * res_w^N` where `res_w = fx_src / fx_vc` (capped at 1.0). At the canvas center, B4 (res_w≈1.0) gets N=4× more weight than each wide camera (res_w≈0.408 → 0.028). Result: B4 telephoto dominates center; wide cameras fill coverage beyond B4's field of view.
+
+**Sharpness measurements at canvas center (1600×1600px ROI)**:
+| Source | Laplacian variance |
+|--------|--------------------|
+| A1 alone (wide, upsampled) | 159,234 |
+| v3 (no CCM, flat-plane depth) | 1,823,985 |
+| B4 alone (telephoto) | 2,241,225 |
+| **v4 (diagonal CCM + flat-plane)** | **1,978,293** |
+
+Canvas fusion is ~12× sharper than A1 alone at center. Active work: raising res_w exponent to bring fusion even closer to B4 alone.
+
+**Diagonal CCM for mirror cameras** — B-group cameras use periscope mirrors that introduce per-channel spectral shifts. A full 3×3 least-squares CCM introduces cross-channel mixing that acts as a spatial low-pass filter (cross-channel averaging ≡ weighted average of adjacent colors). Instead we fit a diagonal-only 3×3 (per-channel median gain, normalized to green channel). This corrects spectral shift with zero effect on spatial frequency content.
+
+**Forward-warp depth** — `forward_warp_depth()` in `lri_depth_loader.py` reprojects depth from source camera pixel-space into the virtual canvas. cv2.resize to canvas dimensions is wrong: it ignores that source camera pixels are not uniformly distributed in canvas space. Error reaches 20-30px for wide cameras at 1000px from optical axis.
 
 ### White balance estimation overhaul ✅ (just landed)
 Three-tier WB in `lri_lumen.py`:
@@ -37,8 +50,9 @@ IFD0 = 8-bit sRGB thumbnail + all DNG metadata tags, SubIFD = full-res 16-bit Li
 
 | Feature | Notes |
 |---------|-------|
-| Per-channel radiometric normalization | Current WLS gain uses single luminance gain. Upgrade to per-channel R/G/B gain estimation to eliminate the residual pink/green cast visible in B-group contributions. |
-| Depth-map reprojection for B-cameras (with depth) | Depth map path exists and code is ready; needs Depth Pro run on A1 to produce `depth/A1.npz` before the 3D warp activates. Homography fallback is used until then. |
+| Raise res_w exponent (N=4→8) | Reduce wide-camera blur contribution at center to bring fusion closer to B4 alone. |
+| Per-camera Depth Pro for all cameras | Currently only A1 has depth. Need Depth Pro inference for B1–B5 to enable forward-warp reprojection. |
+| MOVABLE camera inclusion via LightGlue R refinement | B1/B2/B3/B5 mirrors may have moved since factory calibration. Use LightGlue to refine R before enabling 3D warp. |
 | A-group IBP super-resolution | Iterative Back-Projection on the 5-camera A-group stack for sub-pixel resolution gain. Decision pending on Bayer vs RGB input path. |
 | Exposure fusion (Mertens style) | B4 camera shoots at ~½ the exposure of other cameras. Use for highlight recovery in blown regions. |
 | BAYER_JPEG extraction | 2018-06-26 LRI files use surface format 0 (4 half-res JPEGs per Bayer channel). Unblocks a large set of images. |
@@ -153,6 +167,7 @@ Double-click any LRI in the browser panel to start processing. The pipeline cach
 | `lri_extract.py` | Unpack PACKED_10BPP Bayer, bilinear demosaic → per-camera 16-bit PNGs |
 | `lri_calibration.py` | Parse LRI protobuf headers → camera intrinsics + extrinsics |
 | `lri_fuse_image.py` | Multi-camera image fusion: radiometric normalization, CCM, Laplacian pyramid blend, depth reprojection |
+| `lri_fuse_v2.py` | CLI entry point for v2 synthetic canvas fusion pipeline |
 | `lri_fuse_depth.py` | Reproject per-camera depth maps to reference frame, median fuse |
 | `lri_lumen.py` | Core algorithms: bokeh (CoC blur), tone adjustments, adaptive WB, DNG export |
 | `lri_lumen_app.py` | PySide6 desktop app — library browser + real-time editor |
