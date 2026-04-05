@@ -25,6 +25,48 @@ from lri_depth_loader import forward_warp_depth, _load_raw_depth
 
 
 # ---------------------------------------------------------------------------
+# MVS depth loader (A-cameras)
+# ---------------------------------------------------------------------------
+
+def _load_mvs_depth(lumen_dir: str, virtual_cam) -> np.ndarray | None:
+    """
+    Load pre-computed PatchMatch MVS depth map for the A-camera group.
+
+    The file ``<lumen_dir>/depth/mvs_a_cameras.npz`` contains a float32
+    (H_mvs, W_mvs) depth map expressed in metres in the virtual camera's
+    coordinate frame.  If the map was generated at a reduced scale (e.g.
+    --scale 8 → 1/8 resolution) it is upsampled to the virtual canvas size
+    using bilinear interpolation before being returned.
+
+    Returns
+    -------
+    np.ndarray or None
+        float32 (H_out, W_out) depth in metres, or None if the file is absent.
+    """
+    if lumen_dir is None:
+        return None
+    mvs_path = os.path.join(lumen_dir, 'depth', 'mvs_a_cameras.npz')
+    if not os.path.isfile(mvs_path):
+        return None
+    try:
+        data = np.load(mvs_path)
+        depth = data['depth'].astype(np.float32)  # (H_mvs, W_mvs)
+    except Exception as exc:
+        import warnings
+        warnings.warn(f"Could not load MVS depth from {mvs_path}: {exc}")
+        return None
+
+    H_out, W_out = virtual_cam.H, virtual_cam.W
+    if depth.shape != (H_out, W_out):
+        # Scale mismatch (typical when MVS was run at --scale > 1).
+        # Bilinear resize: nearest-neighbour would introduce aliasing in the
+        # remap lookup; bilinear preserves smooth metric depth gradients.
+        depth = cv2.resize(depth, (W_out, H_out), interpolation=cv2.INTER_LINEAR)
+
+    return depth
+
+
+# ---------------------------------------------------------------------------
 # Image I/O helpers
 # ---------------------------------------------------------------------------
 
@@ -341,6 +383,17 @@ def assemble_canvas(
         canvas = np.zeros((H_out, W_out, 3), dtype=np.float64)
         weight_sum = np.zeros((H_out, W_out), dtype=np.float64)
 
+        # Try to load a single MVS depth map covering all A cameras.
+        # When present it supersedes per-camera Depth Pro NPZ files for
+        # A1–A5, giving geometrically consistent metric depth in the
+        # virtual camera frame — no forward-warp needed.
+        mvs_depth = _load_mvs_depth(lumen_dir, virtual_cam)
+        if mvs_depth is not None:
+            print(f"  MVS depth detected — using mvs_a_cameras.npz for A cameras "
+                  f"(shape {mvs_depth.shape}, range "
+                  f"{mvs_depth[mvs_depth > 0].min():.1f}–{mvs_depth.max():.1f}m)",
+                  flush=True)
+
         for cam_name, cam in cameras.items():
             # Skip movable-mirror cameras in tele mode.
             # In wide mode, include them with a warning (stale R calibration).
@@ -365,18 +418,23 @@ def assemble_canvas(
                 ccm = estimate_ccm_from_cameras(src_img, ref_img, cam, cameras[ref_name])
                 src_img = apply_ccm(src_img, ccm)
 
-            # 3. Resolve per-camera canvas-space depth (forward-warped from source space).
-            # In wide mode, B cameras without a depth NPZ fall back to a fixed 5.0m plane
-            # rather than A1's depth map (which is in a different coordinate system).
-            _b_fixed_depth = (
-                5.0
-                if (vc_mode == 'wide' and cam_name[:1] == 'B')
-                else None
-            )
-            cam_depth = _resolve_depth_for_camera(
-                cam_name, cam, virtual_cam, lumen_dir, depth_map,
-                fixed_fallback_m=_b_fixed_depth,
-            )
+            # 3. Resolve per-camera canvas-space depth.
+            # A cameras: use MVS depth directly when available (already in virtual
+            # camera frame — no forward-warp needed).  Fall back to per-camera
+            # Depth Pro NPZ (forward-warped) if MVS map is absent.
+            # B cameras: unchanged — per-camera Depth Pro NPZ or fixed 5.0m plane.
+            if cam_name[:1] == 'A' and mvs_depth is not None:
+                cam_depth = mvs_depth
+            else:
+                _b_fixed_depth = (
+                    5.0
+                    if (vc_mode == 'wide' and cam_name[:1] == 'B')
+                    else None
+                )
+                cam_depth = _resolve_depth_for_camera(
+                    cam_name, cam, virtual_cam, lumen_dir, depth_map,
+                    fixed_fallback_m=_b_fixed_depth,
+                )
 
             # 4. Load or compute remap
             map_x, map_y, mask = None, None, None
@@ -437,25 +495,42 @@ def assemble_canvas(
         active_cams = list(source_images.keys())
         print(f"  loaded {len(source_images)} cameras: {active_cams}", flush=True)
 
-        # Pre-compute per-camera canvas-space depth maps (forward-warped from source space).
+        # Pre-compute per-camera canvas-space depth maps.
         # Done once before the tile loop — each tile just slices the relevant rows.
+        # A cameras: use MVS depth (single map, already in virtual camera frame) when
+        # mvs_a_cameras.npz is present, bypassing per-camera Depth Pro NPZ forward-warp.
+        # B cameras: unchanged — per-camera Depth Pro NPZ or fixed 5.0m plane.
         print("  resolving per-camera depth maps...", flush=True)
+        mvs_depth = _load_mvs_depth(lumen_dir, virtual_cam)
+        if mvs_depth is not None:
+            valid_mvs = mvs_depth[mvs_depth > 0]
+            print(
+                f"  MVS depth detected — using mvs_a_cameras.npz for A cameras "
+                f"(shape {mvs_depth.shape}, range "
+                f"{valid_mvs.min():.1f}–{mvs_depth.max():.1f}m)",
+                flush=True,
+            )
         per_cam_depth = {}
         for cam_name, cam in cameras.items():
             if cam_name not in source_images:
                 continue
-            # In wide mode, B cameras without a depth NPZ fall back to 5.0m rather
-            # than A1's depth (which is in a different coordinate system).
-            _b_fixed_depth = (
-                5.0
-                if (vc_mode == 'wide' and cam_name[:1] == 'B')
-                else None
-            )
-            cam_depth = _resolve_depth_for_camera(
-                cam_name, cam, virtual_cam, lumen_dir, depth_map,
-                fixed_fallback_m=_b_fixed_depth,
-            )
-            per_cam_depth[cam_name] = cam_depth  # None → flat-plane; array → per-cam
+            if cam_name[:1] == 'A' and mvs_depth is not None:
+                # Use single MVS map directly for all A cameras — no forward-warp needed.
+                per_cam_depth[cam_name] = mvs_depth
+            else:
+                # B cameras (or A cameras when MVS unavailable): existing per-camera path.
+                # In wide mode, B cameras without a depth NPZ fall back to 5.0m rather
+                # than A1's depth (which is in a different coordinate system).
+                _b_fixed_depth = (
+                    5.0
+                    if (vc_mode == 'wide' and cam_name[:1] == 'B')
+                    else None
+                )
+                cam_depth = _resolve_depth_for_camera(
+                    cam_name, cam, virtual_cam, lumen_dir, depth_map,
+                    fixed_fallback_m=_b_fixed_depth,
+                )
+                per_cam_depth[cam_name] = cam_depth  # None → flat-plane; array → per-cam
         n_with_depth = sum(1 for d in per_cam_depth.values() if d is not None)
         print(f"  depth: {n_with_depth}/{len(per_cam_depth)} cameras have per-camera depth",
               flush=True)
