@@ -28,6 +28,36 @@ from lri_depth_loader import forward_warp_depth, _load_raw_depth
 # MVS depth loader (A-cameras)
 # ---------------------------------------------------------------------------
 
+def _load_metric3d_depth(depth_dir: str, cam_name: str, virtual_cam) -> np.ndarray | None:
+    """
+    Load pre-computed Metric3D V2 depth for a single B-camera and resize to
+    the virtual canvas dimensions if necessary.
+
+    Looks for ``<depth_dir>/metric3d_<cam_name>.npz`` (the file written by
+    ``lri_run_metric3d.py``).  The depth map is in native source-camera pixel
+    space (H_src × W_src), float32, metres.  This function only resizes the
+    map to the virtual canvas size; forward-warping into the virtual frame is
+    handled by the caller (``_resolve_depth_for_camera`` → ``forward_warp_depth``).
+
+    Returns
+    -------
+    np.ndarray or None
+        float32 (H_src, W_src) depth in metres, or None if the file is absent.
+    """
+    if depth_dir is None:
+        return None
+    path = os.path.join(depth_dir, f'metric3d_{cam_name}.npz')
+    if not os.path.isfile(path):
+        return None
+    try:
+        data = np.load(path)
+        return data['depth'].astype(np.float32)
+    except Exception as exc:
+        import warnings
+        warnings.warn(f"Could not load Metric3D depth from {path}: {exc}")
+        return None
+
+
 def _load_mvs_depth(lumen_dir: str, virtual_cam) -> np.ndarray | None:
     """
     Load pre-computed PatchMatch MVS depth map for the A-camera group.
@@ -200,6 +230,12 @@ def _resolve_depth_for_camera(
     import os
     npz_path = os.path.join(lumen_dir, 'depth', f'{cam_name}.npz')
     if not os.path.isfile(npz_path):
+        # For B-cameras: try Metric3D V2 depth before falling back to a flat plane.
+        # metric3d_{cam}.npz lives next to the Depth Pro NPZ in the same depth dir.
+        if cam_name.startswith('B'):
+            m3d = _load_metric3d_depth(os.path.join(lumen_dir, 'depth'), cam_name, virtual_cam)
+            if m3d is not None:
+                return forward_warp_depth(m3d, cam, virtual_cam)
         if fixed_fallback_m is not None and fallback_canvas_depth is None:
             from lri_depth_loader import flat_plane_depth
             return flat_plane_depth(virtual_cam, fixed_fallback_m)
