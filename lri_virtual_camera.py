@@ -2,17 +2,34 @@
 """
 lri_virtual_camera.py — Synthetic output canvas for L16 multi-camera fusion.
 
-Defines a VirtualCamera whose:
-  - FOV   = union of all wide cameras (mirror_type='NONE')
-  - Pixel density = median telephoto focal length mapped to the wide FOV
-  - Position (t) = centroid of wide camera translation vectors
+Defines a VirtualCamera with two modes:
 
-This yields a single rectilinear projection that covers the full wide-angle
-view with telephoto-grade angular resolution (~75MP for standard L16
-calibration data).
+  tele (default):
+    - FOV   = union of all wide cameras (mirror_type='NONE')
+    - Pixel density = median telephoto focal length mapped to the wide FOV
+    - Position (t) = centroid of wide camera translation vectors
+    Yields a single rectilinear projection covering the full wide-angle view
+    with telephoto-grade angular resolution (~75MP for standard L16 data).
+
+  wide:
+    - FOV   = union of all A-group cameras (28mm, fx≈3370)
+    - Pixel density = median A-camera focal length (fx≈3370, native resolution)
+    - Position (t) = A1 translation vector (reference camera)
+    Yields a 28mm-equivalent output at native A-camera pixel density (~52MP).
+    This is the primary mode described on Light.co's website: depth from the
+    5×28mm cameras, then B cameras overlaid into the A reference frame.
 """
 
 import numpy as np
+
+# Camera name prefixes for the two groups
+_A_CAMERAS = frozenset({'A1', 'A2', 'A3', 'A4', 'A5'})
+_B_CAMERAS = frozenset({'B1', 'B2', 'B3', 'B4', 'B5'})
+
+# Approximate focal length boundary between A (28mm) and B (70mm) cameras.
+# A cameras: fx≈3370 px; B cameras: fx≈8276 px.
+# Anything below this threshold is treated as a wide/A camera.
+_WIDE_FX_THRESHOLD = 5000.0
 
 
 class VirtualCamera:
@@ -24,6 +41,17 @@ class VirtualCamera:
     cameras : dict
         Camera dict produced by ``load_cameras()`` in lri_fuse_image.py.
         Each entry has keys: K, R, t, W, H, mirror_type.
+    mode : str, optional
+        Output mode.  One of:
+
+        ``'tele'`` (default)
+            fx≈8276 virtual camera covering the full wide FOV at telephoto
+            pixel density.  Reference position = centroid of A cameras.
+
+        ``'wide'``
+            fx≈3370 virtual camera at native 28mm pixel density.  FOV = union
+            of A-group cameras.  Reference position = A1 translation vector
+            (or centroid of A cameras if A1 is not available).
 
     Attributes
     ----------
@@ -32,11 +60,31 @@ class VirtualCamera:
     W, H : int
         Width and height of the output canvas in pixels.
     t : np.ndarray, shape (3,)
-        Camera position (centroid of wide-camera translation vectors).
-        None if no wide camera has a translation vector.
+        Camera position in world coordinates.
+        None if no translation vector is available.
+    mode : str
+        The mode this instance was built with (``'tele'`` or ``'wide'``).
     """
 
-    def __init__(self, cameras: dict):
+    def __init__(self, cameras: dict, mode: str = 'tele'):
+        if mode not in ('tele', 'wide'):
+            raise ValueError(f"mode must be 'tele' or 'wide', got {mode!r}")
+        self.mode = mode
+
+        if mode == 'tele':
+            self._init_tele(cameras)
+        else:
+            self._init_wide(cameras)
+
+    # ── Mode-specific initialisers ────────────────────────────────────────────
+
+    def _init_tele(self, cameras: dict) -> None:
+        """
+        Tele mode (legacy default):
+          FOV = union of A-group (wide) cameras.
+          Pixel density = median B-group (telephoto) focal length.
+          Position = centroid of A-camera translation vectors.
+        """
         # ── Separate wide and telephoto cameras ──────────────────────────────
         wide = {n: c for n, c in cameras.items()
                 if c.get('mirror_type', 'NONE') == 'NONE'}
@@ -49,8 +97,6 @@ class VirtualCamera:
             raise ValueError("No telephoto cameras found.")
 
         # ── Wide-camera FOV union ─────────────────────────────────────────────
-        # For each wide camera compute the half-angle FOV from the principal
-        # point and sensor edges, then take the maximum across all cameras.
         half_fov_h_list = []
         half_fov_v_list = []
         for cam in wide.values():
@@ -61,50 +107,101 @@ class VirtualCamera:
             fy = K[1, 1]
             cx = K[0, 2]
             cy = K[1, 2]
-            # Angular half-extents to the far edge of the sensor
             half_fov_h_list.append(max(np.arctan(cx / fx),
                                        np.arctan((W - cx) / fx)))
             half_fov_v_list.append(max(np.arctan(cy / fy),
                                        np.arctan((H - cy) / fy)))
 
-        half_fov_h = max(half_fov_h_list)   # radians
-        half_fov_v = max(half_fov_v_list)   # radians
+        half_fov_h = max(half_fov_h_list)
+        half_fov_v = max(half_fov_v_list)
 
         # ── Telephoto pixel density ───────────────────────────────────────────
-        # Use median telephoto fx and sensor half-width to derive the angular
-        # resolution (pixels-per-radian) of the finest available camera.
         tele_fx_values = [c['K'][0, 0] for c in tele.values()]
         tele_fy_values = [c['K'][1, 1] for c in tele.values()]
         median_tele_fx = float(np.median(tele_fx_values))
         median_tele_fy = float(np.median(tele_fy_values))
 
-        # ── Output canvas dimensions ──────────────────────────────────────────
-        # Map the wide FOV at telephoto pixel density:
-        #   output_W = 2 * tan(half_fov_h) * output_fx
-        # where output_fx = median_tele_fx (pixels-per-unit-tan).
         output_fx = median_tele_fx
         output_fy = median_tele_fy
 
         W_out = int(round(2.0 * np.tan(half_fov_h) * output_fx))
         H_out = int(round(2.0 * np.tan(half_fov_v) * output_fy))
-
-        # Principal point at centre of output canvas
         cx_out = W_out / 2.0
         cy_out = H_out / 2.0
 
-        # ── Build output intrinsic matrix ─────────────────────────────────────
         self.K = np.array([[output_fx, 0.0,       cx_out],
                            [0.0,       output_fy, cy_out],
                            [0.0,       0.0,       1.0   ]], dtype=np.float64)
         self.W = W_out
         self.H = H_out
 
-        # ── Camera position: centroid of wide-camera translations ─────────────
+        # Position: centroid of wide-camera translations
         ts = [c['t'] for c in wide.values() if c.get('t') is not None]
-        if ts:
-            self.t = np.mean(np.stack(ts, axis=0), axis=0)
+        self.t = np.mean(np.stack(ts, axis=0), axis=0) if ts else None
+
+    def _init_wide(self, cameras: dict) -> None:
+        """
+        Wide mode (28mm output):
+          FOV = union of A-group cameras.
+          Pixel density = median A-group focal length (native 28mm resolution).
+          Position = A1 translation vector, or centroid of A-group cameras.
+
+        In wide mode ALL cameras (A and B) contribute to the output.
+        B cameras with MOVABLE mirrors have stale R calibration — their
+        images are still included but a warning is emitted by the fusion layer.
+        B4 (GLUED mirror) has valid R calibration and is fully trusted.
+        """
+        # A-group cameras: named A1–A5, or fx < _WIDE_FX_THRESHOLD
+        a_cams = {n: c for n, c in cameras.items()
+                  if n in _A_CAMERAS or c['K'][0, 0] < _WIDE_FX_THRESHOLD}
+        if not a_cams:
+            raise ValueError(
+                "No A-group cameras found for wide mode "
+                "(expected cameras named A1–A5 or fx < 5000)."
+            )
+
+        # ── A-camera FOV union ────────────────────────────────────────────────
+        half_fov_h_list = []
+        half_fov_v_list = []
+        for cam in a_cams.values():
+            K = cam['K']
+            W = cam['W']
+            H = cam['H']
+            fx = K[0, 0]
+            fy = K[1, 1]
+            cx = K[0, 2]
+            cy = K[1, 2]
+            half_fov_h_list.append(max(np.arctan(cx / fx),
+                                       np.arctan((W - cx) / fx)))
+            half_fov_v_list.append(max(np.arctan(cy / fy),
+                                       np.arctan((H - cy) / fy)))
+
+        half_fov_h = max(half_fov_h_list)
+        half_fov_v = max(half_fov_v_list)
+
+        # ── A-camera pixel density (native 28mm resolution) ───────────────────
+        a_fx_values = [c['K'][0, 0] for c in a_cams.values()]
+        a_fy_values = [c['K'][1, 1] for c in a_cams.values()]
+        output_fx = float(np.median(a_fx_values))
+        output_fy = float(np.median(a_fy_values))
+
+        W_out = int(round(2.0 * np.tan(half_fov_h) * output_fx))
+        H_out = int(round(2.0 * np.tan(half_fov_v) * output_fy))
+        cx_out = W_out / 2.0
+        cy_out = H_out / 2.0
+
+        self.K = np.array([[output_fx, 0.0,       cx_out],
+                           [0.0,       output_fy, cy_out],
+                           [0.0,       0.0,       1.0   ]], dtype=np.float64)
+        self.W = W_out
+        self.H = H_out
+
+        # Position: prefer A1 as reference camera (matches Light.co architecture)
+        if 'A1' in cameras and cameras['A1'].get('t') is not None:
+            self.t = np.asarray(cameras['A1']['t'], dtype=np.float64).ravel()
         else:
-            self.t = None
+            ts = [c['t'] for c in a_cams.values() if c.get('t') is not None]
+            self.t = np.mean(np.stack(ts, axis=0), axis=0) if ts else None
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -177,10 +274,13 @@ if __name__ == '__main__':
     from lri_fuse_image import load_cameras
 
     if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <calibration.json>")
+        print(f"Usage: {sys.argv[0]} <calibration.json> [tele|wide]")
         sys.exit(1)
 
     cameras = load_cameras(sys.argv[1])
-    vc = VirtualCamera(cameras)
+    mode = sys.argv[2] if len(sys.argv) > 2 else 'tele'
+    vc = VirtualCamera(cameras, mode=mode)
+    print(f"Mode: {mode}")
     print(f"Output canvas: {vc.W}×{vc.H} = {vc.W * vc.H / 1e6:.1f}MP")
     print(f"K:\n{vc.K}")
+    print(f"t: {vc.t}")

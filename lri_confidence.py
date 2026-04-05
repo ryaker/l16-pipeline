@@ -82,28 +82,57 @@ def compute_confidence(
     """
     Compute full confidence map for one camera.
 
-    Confidence = taper * res_w^8
+    Tele mode (virtual fx≈8276):
+        Confidence = taper * res_w^8
 
-    Using res_w^8 (rather than res_w² × sharpness) because:
-    - The sharpness component is unreliable: telephoto cameras (B4) have extreme
-      local peaks (LEDs, chrome) that compress the global sharpness scale,
-      making their normalized sharpness LOWER than wide cameras'.
-    - This caused wide cameras (5 × 0.166 = 0.83 total) to outweigh B4 (1.0)
-      by weight, introducing 10-47px parallax ghosting that destroyed sharpness.
-    - res_w^8 gives telephoto B4 a weight of 1.0 vs each wide camera at ~0.0007,
-      so B4 captures ~99.6% of the blended weight where it has coverage,
-      reducing wide-camera blurring at the canvas center vs N=4 (~88%).
+        res_w^8 gives B4 (fx≈8276, res_w=1.0) a weight of 1.0 vs each A
+        camera (fx≈3370, res_w≈0.41) at ~0.0007, so B4 captures ~99.6% of
+        the blended weight where it has coverage, eliminating wide-camera
+        parallax ghosting at the canvas centre.
+
+    Wide mode (virtual fx≈3370):
+        In wide mode both A cameras (fx≈3370) and B cameras (fx≈8276) have
+        res_w = min(fx/fx_virt, 1.0) = 1.0 — the resolution scalar no longer
+        differentiates them.  Using res_w^8 would give every camera identical
+        weight, erasing useful depth-based alignment information that B cameras
+        contribute when correctly warped.
+
+        Instead, wide mode uses taper-only confidence (equal scalar weight = 1)
+        so that the depth warp is the sole arbiter of each camera's contribution.
+        Pixels near coverage boundaries still fade smoothly via the taper.
+        B cameras with stale MOVABLE mirror calibration may produce misaligned
+        contributions — these are handled at the fusion layer (warning + skip or
+        fixed-depth fallback), not here.
+
+    Parameters
+    ----------
+    source_img : np.ndarray
+        Raw source frame (used only if sharpness_map is needed in future).
+    source_cam : dict
+        Camera calibration dict (K, R, t, W, H, mirror_type).
+    virtual_cam : VirtualCamera
+        Target canvas.  ``virtual_cam.mode`` selects the confidence formula.
+    coverage_mask : np.ndarray
+        Boolean (H_out, W_out) indicating where this camera has valid pixels.
+    map_x, map_y : np.ndarray
+        Remap arrays from compute_remap (unused directly, reserved for future
+        sharpness-at-canvas-location weighting).
     """
-    # 1. Resolution weight (scalar)
-    res_w = resolution_weight(source_cam, virtual_cam)
+    vc_mode = getattr(virtual_cam, 'mode', 'tele')
 
-    # 2. Smooth boundary falloff
+    # Smooth boundary falloff (used in both modes)
     taper = coverage_taper(coverage_mask)
 
-    # 3. Confidence = taper * res_w^8
-    confidence = taper * (res_w ** 8)
+    if vc_mode == 'wide':
+        # Wide mode: taper only — equal weight for all cameras, let depth warp
+        # determine spatial contributions.
+        confidence = taper.copy()
+    else:
+        # Tele mode: res_w^8 strongly favours telephoto cameras.
+        res_w = resolution_weight(source_cam, virtual_cam)
+        confidence = taper * (res_w ** 8)
 
-    # 4. Zero out pixels outside coverage
+    # Zero out pixels outside coverage
     confidence[~coverage_mask] = 0.0
 
     return confidence.astype(np.float32)

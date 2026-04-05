@@ -40,21 +40,30 @@ def fuse_v2(frames_dir: str, cal_path: str, output_path: str, **opts) -> str:
     output_path : str
         Destination PNG path.
     **opts : keyword arguments
-        depth, no_ccm, flat_plane, tile_rows, remap_cache, no_cache, small
+        mode, depth, no_ccm, flat_plane, tile_rows, remap_cache, no_cache, small
+
+        mode : str
+            ``'tele'`` (default) — fx≈8276, ~75MP output.
+            ``'wide'``           — fx≈3370, ~52MP 28mm-equivalent output.
+            Wide mode uses all A cameras for depth and overlays B cameras into
+            the A1 reference frame using depth.  B cameras with MOVABLE mirrors
+            (B1, B2, B3, B5) carry a stale factory R calibration; their
+            contribution is included with a warning.  B4 (GLUED) is fully trusted.
 
     Returns
     -------
     str
         Absolute path to the saved output PNG.
     """
-    print("=== L16 Synthetic Canvas Fusion v2 ===")
+    mode = opts.get('mode', 'tele')
+    print(f"=== L16 Synthetic Canvas Fusion v2  [{mode} mode] ===")
 
     # 1. Load calibration
     cameras = load_cameras(cal_path)
     print(f"  Cameras: {list(cameras.keys())}")
 
     # 2. Build virtual camera
-    vc = VirtualCamera(cameras)
+    vc = VirtualCamera(cameras, mode=mode)
     if opts.get('small'):
         vc.K[0, 0] /= 4
         vc.K[1, 1] /= 4
@@ -92,19 +101,34 @@ def fuse_v2(frames_dir: str, cal_path: str, output_path: str, **opts) -> str:
                 print(f"  WARNING: unrecognised depth file extension '{ext}', using flat-plane")
                 depth = flat_plane_depth(vc)
         else:
-            # Find the reference wide camera (closest to origin)
-            wide_cams = {
-                n: c for n, c in cameras.items()
-                if c.get('mirror_type', 'NONE') == 'NONE'
-            }
-            ref_name = min(
-                wide_cams,
-                key=lambda n: (
-                    np.linalg.norm(wide_cams[n]['t'])
-                    if wide_cams[n].get('t') is not None
-                    else float('inf')
-                ),
-            )
+            # Determine the reference camera for the initial depth map load.
+            # Wide mode: always use A1 (the reference camera for the 28mm group).
+            # Tele mode: use the wide camera closest to origin (legacy behaviour).
+            if mode == 'wide':
+                if 'A1' in cameras:
+                    ref_name = 'A1'
+                else:
+                    # Fallback: any A camera or first wide camera
+                    wide_cams = {
+                        n: c for n, c in cameras.items()
+                        if c.get('mirror_type', 'NONE') == 'NONE'
+                    }
+                    a_cams_avail = [n for n in wide_cams if n.startswith('A')]
+                    ref_name = a_cams_avail[0] if a_cams_avail else next(iter(wide_cams))
+                print(f"  Wide mode: reference camera = {ref_name}")
+            else:
+                wide_cams = {
+                    n: c for n, c in cameras.items()
+                    if c.get('mirror_type', 'NONE') == 'NONE'
+                }
+                ref_name = min(
+                    wide_cams,
+                    key=lambda n: (
+                        np.linalg.norm(wide_cams[n]['t'])
+                        if wide_cams[n].get('t') is not None
+                        else float('inf')
+                    ),
+                )
             depth = load_depth_for_canvas(lumen_dir, vc, ref_name, cameras[ref_name])
 
         if depth is None:
@@ -156,8 +180,13 @@ def main():
     )
     parser.add_argument('frames_dir',        help='Directory containing A1.png … B5.png')
     parser.add_argument('calibration_json',  help='Factory calibration JSON path')
+    parser.add_argument('--mode',            default='tele', choices=['tele', 'wide'],
+                        help='Output mode: tele (default, fx≈8276, ~75MP) or '
+                             'wide (28mm, fx≈3370, ~52MP). '
+                             'Wide mode: depth from A cameras, B cameras overlaid '
+                             'into the A1 reference frame using depth.')
     parser.add_argument('--output',          default=None,
-                        help='Output PNG path [default: <lumen_dir>/fused_v2.png]')
+                        help='Output PNG path [default: <lumen_dir>/fused_v2[_wide].png]')
     parser.add_argument('--depth',           default=None,
                         help='Override depth map path (uint16 mm PNG or float32 .npz)')
     parser.add_argument('--no-ccm',          action='store_true',
@@ -176,13 +205,15 @@ def main():
 
     if args.output is None:
         lumen_dir = os.path.dirname(args.frames_dir.rstrip('/\\'))
-        suffix = '_small' if args.small else ''
-        args.output = os.path.join(lumen_dir, f'fused_v2{suffix}.png')
+        mode_suffix = '_wide' if args.mode == 'wide' else ''
+        scale_suffix = '_small' if args.small else ''
+        args.output = os.path.join(lumen_dir, f'fused_v2{mode_suffix}{scale_suffix}.png')
 
     fuse_v2(
         args.frames_dir,
         args.calibration_json,
         args.output,
+        mode=args.mode,
         depth=args.depth,
         no_ccm=args.no_ccm,
         flat_plane=args.flat_plane,

@@ -124,6 +124,7 @@ def _resolve_depth_for_camera(
     virtual_cam,
     lumen_dir: str,
     fallback_canvas_depth,
+    fixed_fallback_m: float = None,
 ) -> np.ndarray:
     """
     Return the best available canvas-space depth (H_out, W_out) float32 metres for
@@ -132,6 +133,9 @@ def _resolve_depth_for_camera(
       1. Per-camera depth NPZ at <lumen_dir>/depth/<cam_name>.npz, forward-warped
          to virtual camera canvas space using THIS camera's own calibration.
       2. fallback_canvas_depth (pre-loaded canvas-space depth passed in by the caller).
+      3. If fixed_fallback_m is given and steps 1–2 produce nothing, return a constant
+         depth plane at fixed_fallback_m metres.  Used for B cameras in wide mode
+         when no per-camera depth file exists.
 
     IMPORTANT: The fused PNG (fused_*cams_*depth.png) is in the source reference
     camera's pixel space (typically A1's 4160×3120 sensor grid) — NOT virtual camera
@@ -145,18 +149,27 @@ def _resolve_depth_for_camera(
     right depth rather than the wrong depth from a naive pixel-grid resize.
     """
     if lumen_dir is None:
+        if fixed_fallback_m is not None and fallback_canvas_depth is None:
+            from lri_depth_loader import flat_plane_depth
+            return flat_plane_depth(virtual_cam, fixed_fallback_m)
         return fallback_canvas_depth
 
     # Only use the per-camera NPZ — NOT the fused PNG (which is in another camera's space)
     import os
     npz_path = os.path.join(lumen_dir, 'depth', f'{cam_name}.npz')
     if not os.path.isfile(npz_path):
+        if fixed_fallback_m is not None and fallback_canvas_depth is None:
+            from lri_depth_loader import flat_plane_depth
+            return flat_plane_depth(virtual_cam, fixed_fallback_m)
         return fallback_canvas_depth
 
     try:
         data = np.load(npz_path)
         raw_depth = data['depth'].astype(np.float32)
     except Exception:
+        if fixed_fallback_m is not None and fallback_canvas_depth is None:
+            from lri_depth_loader import flat_plane_depth
+            return flat_plane_depth(virtual_cam, fixed_fallback_m)
         return fallback_canvas_depth
 
     return forward_warp_depth(raw_depth, cam, virtual_cam)
@@ -203,15 +216,28 @@ def _assemble_tile(
     tvc.R = getattr(virtual_cam, 'R', np.eye(3))
     tvc.t = getattr(virtual_cam, 't', np.zeros(3))
 
+    vc_mode = getattr(virtual_cam, 'mode', 'tele')
+
     for cam_name, cam in cameras.items():
         if cam_name not in source_images:
             continue
 
-        # Skip movable-mirror cameras: their factory calibration R is stale
-        # (mirror shifted post-calibration), so compute_remap gives wrong coords.
-        # These cameras need LightGlue image-based alignment (not yet implemented).
+        # Skip movable-mirror cameras in tele mode: their factory calibration R
+        # is stale (mirror shifted post-calibration), so compute_remap gives
+        # wrong coords.  These cameras need LightGlue image-based alignment.
+        # In wide mode we include them (after a one-time warning) because the
+        # B cameras contribute additional resolution; depth-guided warping
+        # compensates for coarse alignment errors.
         if cam.get('mirror_type', 'NONE') == 'MOVABLE':
-            continue
+            if vc_mode != 'wide':
+                continue
+            # Wide mode: emit one-time warning per camera then proceed.
+            import warnings
+            warnings.warn(
+                f"Camera {cam_name} has a MOVABLE mirror — factory R calibration "
+                "may be stale. Alignment in wide mode may be imperfect.",
+                stacklevel=2,
+            )
 
         # 1. Source image already loaded and CCM-corrected
         src_img = source_images[cam_name]
@@ -308,15 +334,25 @@ def assemble_canvas(
     ref_name = _select_ref_camera(cameras)
     ref_img = load_image(frames_dir, ref_name)  # uint16
 
+    vc_mode = getattr(virtual_cam, 'mode', 'tele')
+
     if tile_rows is None:
         # ── Full-frame path (simple, single pass) ─────────────────────────
         canvas = np.zeros((H_out, W_out, 3), dtype=np.float64)
         weight_sum = np.zeros((H_out, W_out), dtype=np.float64)
 
         for cam_name, cam in cameras.items():
-            # Skip movable-mirror cameras: stale factory calibration
+            # Skip movable-mirror cameras in tele mode.
+            # In wide mode, include them with a warning (stale R calibration).
             if cam.get('mirror_type', 'NONE') == 'MOVABLE':
-                continue
+                if vc_mode != 'wide':
+                    continue
+                import warnings
+                warnings.warn(
+                    f"Camera {cam_name} has a MOVABLE mirror — factory R calibration "
+                    "may be stale. Alignment in wide mode may be imperfect.",
+                    stacklevel=2,
+                )
             frame_path = os.path.join(frames_dir, f'{cam_name}.png')
             if not os.path.exists(frame_path):
                 continue
@@ -329,9 +365,17 @@ def assemble_canvas(
                 ccm = estimate_ccm_from_cameras(src_img, ref_img, cam, cameras[ref_name])
                 src_img = apply_ccm(src_img, ccm)
 
-            # 3. Resolve per-camera canvas-space depth (forward-warped from source space)
+            # 3. Resolve per-camera canvas-space depth (forward-warped from source space).
+            # In wide mode, B cameras without a depth NPZ fall back to a fixed 5.0m plane
+            # rather than A1's depth map (which is in a different coordinate system).
+            _b_fixed_depth = (
+                5.0
+                if (vc_mode == 'wide' and cam_name[:1] == 'B')
+                else None
+            )
             cam_depth = _resolve_depth_for_camera(
-                cam_name, cam, virtual_cam, lumen_dir, depth_map
+                cam_name, cam, virtual_cam, lumen_dir, depth_map,
+                fixed_fallback_m=_b_fixed_depth,
             )
 
             # 4. Load or compute remap
@@ -366,10 +410,21 @@ def assemble_canvas(
         # Preload all source images once (avoid 260 disk reads for 26 tiles × 10 cameras)
         print("  preloading source images...", flush=True)
         source_images = {}
+        _movable_warned: set = set()
         for cam_name, cam in cameras.items():
-            # Skip movable-mirror cameras: stale factory calibration, wrong remap
+            # Skip movable-mirror cameras in tele mode.
+            # In wide mode, include them with a per-camera warning.
             if cam.get('mirror_type', 'NONE') == 'MOVABLE':
-                continue
+                if vc_mode != 'wide':
+                    continue
+                if cam_name not in _movable_warned:
+                    import warnings
+                    warnings.warn(
+                        f"Camera {cam_name} has a MOVABLE mirror — factory R calibration "
+                        "may be stale. Alignment in wide mode may be imperfect.",
+                        stacklevel=2,
+                    )
+                    _movable_warned.add(cam_name)
             frame_path = os.path.join(frames_dir, f'{cam_name}.png')
             if not os.path.exists(frame_path):
                 continue
@@ -389,8 +444,16 @@ def assemble_canvas(
         for cam_name, cam in cameras.items():
             if cam_name not in source_images:
                 continue
+            # In wide mode, B cameras without a depth NPZ fall back to 5.0m rather
+            # than A1's depth (which is in a different coordinate system).
+            _b_fixed_depth = (
+                5.0
+                if (vc_mode == 'wide' and cam_name[:1] == 'B')
+                else None
+            )
             cam_depth = _resolve_depth_for_camera(
-                cam_name, cam, virtual_cam, lumen_dir, depth_map
+                cam_name, cam, virtual_cam, lumen_dir, depth_map,
+                fixed_fallback_m=_b_fixed_depth,
             )
             per_cam_depth[cam_name] = cam_depth  # None → flat-plane; array → per-cam
         n_with_depth = sum(1 for d in per_cam_depth.values() if d is not None)
