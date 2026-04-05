@@ -97,7 +97,142 @@ def save_16bit_png(path: str, img: np.ndarray) -> None:
     cv2.imwrite(path, cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
 
 
+# ── coverage mask ────────────────────────────────────────────────────────────
+
+def coverage_mask(H: np.ndarray,
+                  src_hw: tuple, dst_hw: tuple,
+                  feather_px: int = 60) -> np.ndarray:
+    """
+    Return float32 (dst_H, dst_W) in [0,1] indicating which dst pixels have
+    valid content when warping src → dst through homography H.
+
+    Warps a fully-ones src mask through H.  Pixels that fall outside the src
+    sensor bounds become 0; the boundary is softened with a Gaussian feather
+    so blending is smooth rather than a hard cut.
+    """
+    src_h, src_w = src_hw
+    dst_h, dst_w = dst_hw
+    src_ones = np.ones((src_h, src_w), dtype=np.float32)
+    dst_mask = cv2.warpPerspective(src_ones, H, (dst_w, dst_h),
+                                   flags=cv2.INTER_LINEAR,
+                                   borderMode=cv2.BORDER_CONSTANT,
+                                   borderValue=0.0)
+    if feather_px > 0:
+        k = feather_px * 2 + 1
+        dst_mask = cv2.GaussianBlur(dst_mask, (k, k), feather_px / 3.0)
+        dst_mask = np.clip(dst_mask, 0.0, 1.0)
+    return dst_mask
+
+
+# ── consistency weight ───────────────────────────────────────────────────────
+
+def consistency_weight(ref: np.ndarray, warped: np.ndarray,
+                       sigma: float = 2000.0) -> np.ndarray:
+    """
+    Per-pixel weight: how well does `warped` match `ref`?
+
+    Returns float32 (H, W) in [0, 1].  Near 1 where warped ≈ ref (good
+    alignment), near 0 where they differ (flow failure / overexposed ceiling /
+    misregistration).  When a pixel's weight is low the accumulator falls back
+    to the A1 reference which already has full weight there.
+
+    sigma controls the tolerance: 2000 ≈ 3% of the 16-bit range (strict).
+
+    Overexposure suppression: pixels where ref is near-saturated (>85% of
+    65535) get progressively zeroed out.  Overexposed glass/sky regions have
+    no reliable gradient for RAFT to track, so any secondary-camera
+    contribution there is likely misaligned.  Falling back to A1 alone is
+    cleaner than a ghost blend of badly-matched frames.
+    """
+    # ── alignment consistency ─────────────────────────────────────────────────
+    diff = np.abs(warped.astype(np.float32) - ref.astype(np.float32)).mean(axis=2)
+    diff = cv2.GaussianBlur(diff, (31, 31), 10.0)
+    w = np.exp(-diff / sigma)
+
+    # ── overexposure mask ─────────────────────────────────────────────────────
+    # ramp: 1.0 at ≤85% sat, 0.0 at ≥95% sat  (linear ramp over 10% window)
+    ref_f  = ref.astype(np.float32)
+    ref_mx = ref_f.max(axis=2) / 65535.0          # brightest channel per pixel
+    ovr    = np.clip((ref_mx - 0.85) / 0.10, 0.0, 1.0)   # 0..1 overexposure
+    sat_mask = 1.0 - ovr                           # 1=good, 0=blown-out
+
+    return (w * sat_mask).astype(np.float32)
+
+
 # ── sharpness weight ─────────────────────────────────────────────────────────
+
+def laplacian_pyramid_blend(frames: list, weights: list, levels: int = 6) -> np.ndarray:
+    """
+    Multi-scale Laplacian pyramid blend of N aligned frames.
+
+    frames  : list of float32 (H, W, 3) arrays in [0..65535] range
+    weights : list of float32 (H, W) weight maps (not normalised — raw sharpness×mask×consistency)
+    levels  : number of pyramid levels (6 = ~64px resolution at base)
+
+    Returns float32 (H, W, 3) blended image.
+
+    Why this fixes halos vs weighted-average:
+      Weighted average mixes pixel VALUES across all frames at once.  At a depth
+      edge, a sharp-foreground pixel from cam A and a blurred-background pixel
+      from cam B get averaged — producing a half-sharp, half-blurred ghost.
+      Laplacian pyramid blending separates low-frequency content (base colour,
+      gradual tone) from high-frequency content (edges, texture) and blends them
+      independently at each spatial scale.  The edge detail from the sharpest
+      camera dominates at fine scales; colour and brightness average naturally
+      at coarse scales.  No halos.
+    """
+    N = len(frames)
+    assert N == len(weights) and N > 0
+
+    H, W = frames[0].shape[:2]
+
+    # ── Build per-frame Laplacian pyramids + normalised weight pyramids ────────
+    lp_pyramids = []   # lp_pyramids[i][l] = Laplacian level l for frame i
+    gp_weights  = []   # gp_weights[i][l]  = Gaussian weight level l for frame i
+
+    for i in range(N):
+        # Gaussian pyramid for the image
+        gp_img = [frames[i].astype(np.float32)]
+        for _ in range(levels - 1):
+            gp_img.append(cv2.pyrDown(gp_img[-1]))
+
+        # Laplacian pyramid: difference between consecutive Gaussian levels
+        lp = []
+        for l in range(levels - 1):
+            up = cv2.pyrUp(gp_img[l + 1], dstsize=(gp_img[l].shape[1], gp_img[l].shape[0]))
+            lp.append(gp_img[l] - up)
+        lp.append(gp_img[-1])  # coarsest level is kept as-is
+        lp_pyramids.append(lp)
+
+        # Gaussian pyramid for the weight map
+        w = weights[i].astype(np.float32)
+        gp_w = [w]
+        for _ in range(levels - 1):
+            gp_w.append(cv2.pyrDown(gp_w[-1]))
+        gp_weights.append(gp_w)
+
+    # ── Blend each pyramid level ───────────────────────────────────────────────
+    blended_pyr = []
+    for l in range(levels):
+        # Stack weight maps at this level and normalise so they sum to 1
+        w_stack = np.stack([gp_weights[i][l] for i in range(N)], axis=0)   # (N, H_l, W_l)  # gp_weights[i][l] — level-matched weight pyramid (correct)
+        w_sum   = w_stack.sum(axis=0, keepdims=True).clip(min=1e-6)
+        w_norm  = w_stack / w_sum                                            # (N, H_l, W_l)
+
+        # Weighted blend of Laplacian coefficients at this level
+        blended = np.zeros_like(lp_pyramids[0][l])
+        for i in range(N):
+            blended += lp_pyramids[i][l] * w_norm[i, ..., np.newaxis]
+        blended_pyr.append(blended)
+
+    # ── Collapse the blended pyramid back to full resolution ─────────────────
+    result = blended_pyr[-1]
+    for l in range(levels - 2, -1, -1):
+        result = cv2.pyrUp(result, dstsize=(blended_pyr[l].shape[1], blended_pyr[l].shape[0]))
+        result = result + blended_pyr[l]
+
+    return result.clip(0, 65535).astype(np.float32)
+
 
 def sharpness_weight(img: np.ndarray, ksize: int = 7) -> np.ndarray:
     """
@@ -216,46 +351,130 @@ def homography_from_calibration(cam_ref: dict, cam_src: dict) -> np.ndarray:
     return H
 
 
+def depth_reproject_warp(ref: np.ndarray, src: np.ndarray,
+                        cam_a1: dict, cam_b: dict,
+                        depth_map: np.ndarray) -> tuple:
+    """
+    Warp src (B-camera frame) into A1 reference space using a depth map.
+
+    Instead of a planar homography, each A1 pixel is unprojected to 3D using
+    its measured depth, transformed to the B-camera frame via R/t, and
+    reprojected onto the B image plane.  This correctly handles parallax for
+    non-planar scenes.
+
+    ref       : float32 (H, W, 3) A1 reference frame (used for shape only)
+    src       : float32 (H, W, 3) B-camera frame at native resolution
+    cam_a1    : dict with key 'K' — 3x3 intrinsic for A1 (R/t assumed identity)
+    cam_b     : dict with keys 'K' (3x3 intrinsic), 'R' (3x3 rotation),
+                't' (3,) translation — world->B-cam extrinsics
+    depth_map : float32 (H, W) depth in metres, co-registered with ref
+
+    Returns (warped, coverage) float32 arrays of shape (H, W, 3) and (H, W).
+    """
+    H, W = ref.shape[:2]
+    H_src, W_src = src.shape[:2]
+
+    K_A = cam_a1['K']
+    K_B = cam_b['K']
+    R   = cam_b['R']
+    t   = cam_b['t'].reshape(3)
+
+    # Build pixel coordinate grid for A1
+    cols, rows = np.meshgrid(np.arange(W, dtype=np.float64),
+                             np.arange(H, dtype=np.float64))
+    ones = np.ones((H, W), dtype=np.float64)
+
+    # Unproject A1 pixels to 3D using depth
+    K_A_inv = np.linalg.inv(K_A)
+    pts_h   = np.stack([cols, rows, ones], axis=-1)          # (H, W, 3)
+    pts_cam = (K_A_inv @ pts_h.reshape(-1, 3).T).T.reshape(H, W, 3)
+    pts_3d  = pts_cam * depth_map[:, :, np.newaxis]          # (H, W, 3)
+
+    # Transform to B-camera frame:  X_B = R @ X_A1 + t
+    pts_b = (R @ pts_3d.reshape(-1, 3).T + t.reshape(3, 1)).T.reshape(H, W, 3)
+
+    # Project onto B image plane
+    z_b       = pts_b[:, :, 2:3].clip(min=1e-6)
+    pts_b_nrm = pts_b / z_b                                  # (H, W, 3)
+    pts_b_px  = (K_B @ pts_b_nrm.reshape(-1, 3).T).T.reshape(H, W, 3)
+
+    map_x = pts_b_px[:, :, 0].astype(np.float32)
+    map_y = pts_b_px[:, :, 1].astype(np.float32)
+
+    # Sample B-frame at the computed coordinates
+    warped = cv2.remap(src, map_x, map_y,
+                       interpolation=cv2.INTER_LINEAR,
+                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+    # Coverage mask: valid where projected coords land inside B-frame bounds
+    # and depth is positive
+    valid = ((map_x >= 0) & (map_x < W_src) &
+             (map_y >= 0) & (map_y < H_src) &
+             (depth_map > 0))
+    cov = valid.astype(np.float32)
+    # Feather edges for smooth blending (matches coverage_mask feather style)
+    cov = cv2.GaussianBlur(cov, (0, 0), sigmaX=30).clip(0, 1)
+
+    return warped.astype(np.float32), cov.astype(np.float32)
+
+
 def align_b_camera(ref: np.ndarray, src: np.ndarray,
-                   cam_ref: dict, cam_src: dict) -> tuple:
+                   cam_ref: dict, cam_src: dict,
+                   depth_map: np.ndarray | None = None) -> tuple:
     """
     Align a B-group src frame to A1 ref using:
       1. Calibration homography (initial estimate)
       2. SuperPoint + LightGlue feature refinement (improves accuracy)
       3. Perspective warp to A1 canvas
 
+    If depth_map is provided (float32 H×W, metres, co-registered with ref),
+    uses depth_reproject_warp() instead for a true 3D warp that correctly
+    handles parallax from the physical B-camera baseline.
+
     Returns (warped, mask) float32.
+    mask is a coverage mask: 1.0 where src sensor pixels land in ref space,
+    0.0 outside (feathered).  This prevents B-camera content from bleeding
+    into the wide-angle corners/ceiling where it has no valid data.
     """
-    H, W = ref.shape[:2]
+    if depth_map is not None:
+        return depth_reproject_warp(ref, src, cam_ref, cam_src, depth_map)
+
+    H_ref, W_ref = ref.shape[:2]
+    H_src, W_src = src.shape[:2]
 
     # ── Step 1: calibration homography ───────────────────────────────────────
     H_cal = homography_from_calibration(cam_ref, cam_src)
 
     # ── Step 2: warp src to ref space with initial homography ────────────────
     if H_cal is not None:
-        src_pre = cv2.warpPerspective(src, H_cal, (W, H),
+        src_pre = cv2.warpPerspective(src, H_cal, (W_ref, H_ref),
                                       flags=cv2.INTER_LINEAR,
                                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        H_total = H_cal.copy()
     else:
-        # No calibration — try direct feature matching (fallback)
         src_pre = src.copy()
-        H_cal   = np.eye(3)
+        H_total = np.eye(3, dtype=np.float64)
 
     # ── Step 3: LightGlue refinement ─────────────────────────────────────────
     try:
         H_refined = _lightglue_refine(ref, src_pre)
         if H_refined is not None:
-            warped = cv2.warpPerspective(src_pre, H_refined, (W, H),
-                                         flags=cv2.INTER_LINEAR,
-                                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            warped  = cv2.warpPerspective(src_pre, H_refined, (W_ref, H_ref),
+                                          flags=cv2.INTER_LINEAR,
+                                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            H_total = H_refined @ H_total
         else:
             warped = src_pre
     except Exception as e:
         print(f"    LightGlue failed ({e}), using calibration-only warp")
         warped = src_pre
 
-    mask = (warped.sum(axis=2) > 0).astype(np.float32)
-    return warped, mask
+    # Coverage mask: which output pixels came from valid src sensor coordinates.
+    # Warping a src-shaped ones-mask through H_total gives exactly this region.
+    # A telephoto B-camera only covers the center of A1; the mask goes to zero
+    # outside that region, preventing ceiling/corner artifacts.
+    cov = coverage_mask(H_total, (H_src, W_src), (H_ref, W_ref), feather_px=60)
+    return warped, cov
 
 
 _lg_extractor = None
@@ -315,6 +534,79 @@ def _lightglue_refine(ref: np.ndarray, src: np.ndarray) -> np.ndarray | None:
     return H_ref
 
 
+# ── radiometric normalization ────────────────────────────────────────────────
+
+def radiometric_normalize(src: np.ndarray, ref: np.ndarray,
+                          coverage: np.ndarray) -> np.ndarray:
+    """
+    Per-channel WLS gain+bias normalization of src to match ref.
+    Weight = 1/(|grad_ref| + 1e-3) to exclude edges from estimation.
+    src, ref: float32 (H,W,3) in [0..65535]
+    coverage: float32 (H,W) mask of valid overlap pixels
+    Returns: normalized src, float32 (H,W,3)
+    """
+    result = src.copy()
+    # Gradient magnitude of ref (grayscale)
+    ref_gray = cv2.cvtColor((ref / 65535.0).astype(np.float32), cv2.COLOR_RGB2GRAY)
+    gx = cv2.Sobel(ref_gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(ref_gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(gx**2 + gy**2)
+    w = (1.0 / (grad_mag + 1e-3)) * (coverage > 0).astype(np.float32)
+    w_flat = w.ravel()
+
+    for c in range(3):
+        s = src[:, :, c].ravel().astype(np.float64)
+        r = ref[:, :, c].ravel().astype(np.float64)
+        wf = w_flat.astype(np.float64)
+        # WLS: minimize sum w*(g*s + b - r)^2
+        # Normal equations: [[sum(w*s^2), sum(w*s)], [sum(w*s), sum(w)]] * [g,b] = [sum(w*s*r), sum(w*r)]
+        ws2 = np.sum(wf * s * s)
+        ws  = np.sum(wf * s)
+        ww  = np.sum(wf)
+        wsr = np.sum(wf * s * r)
+        wr  = np.sum(wf * r)
+        if ww < 100:  # insufficient overlap
+            continue
+        A = np.array([[ws2, ws], [ws, ww]])
+        b_vec = np.array([wsr, wr])
+        try:
+            g, b = np.linalg.solve(A, b_vec)
+            # Sanity clamp: gain should be near 1.0
+            g = float(np.clip(g, 0.5, 2.0))
+            b = float(np.clip(b, -5000, 5000))
+            result[:, :, c] = np.clip(g * src[:, :, c] + b, 0, 65535)
+        except np.linalg.LinAlgError:
+            pass  # singular — skip normalization for this channel
+    return result
+
+
+# ── color correction matrix (B-group only) ───────────────────────────────────
+
+def estimate_ccm(src: np.ndarray, ref: np.ndarray,
+                 coverage: np.ndarray) -> np.ndarray | None:
+    """
+    Estimate 3x3 CCM mapping src RGB -> ref RGB in overlap region.
+    src, ref: float32 (H,W,3)
+    coverage: float32 (H,W) overlap mask
+    Returns 3x3 float64 CCM, or None if insufficient overlap.
+    """
+    mask = coverage > 0.5
+    if mask.sum() < 500:
+        return None
+    s = src[mask].astype(np.float64)   # (N, 3)
+    r = ref[mask].astype(np.float64)   # (N, 3)
+    # Solve s @ CCM ≈ r  →  CCM = lstsq(s, r)
+    ccm, _, _, _ = np.linalg.lstsq(s, r, rcond=None)
+    return ccm  # shape (3, 3)
+
+
+def apply_ccm(src: np.ndarray, ccm: np.ndarray) -> np.ndarray:
+    """Apply 3x3 CCM to float32 (H,W,3) image. Returns float32 (H,W,3)."""
+    H, W = src.shape[:2]
+    result = (src.reshape(-1, 3).astype(np.float64) @ ccm).reshape(H, W, 3)
+    return result.clip(0, 65535).astype(np.float32)
+
+
 # ── core fusion ──────────────────────────────────────────────────────────────
 
 A_CAMS = ['A1', 'A2', 'A3', 'A4', 'A5']
@@ -344,13 +636,8 @@ def fuse_frames(frames_dir: str, cal_path: str, output_path: str) -> str:
     H_ref, W_ref = ref.shape[:2]
     print(f"  A1 reference: {W_ref}×{H_ref}")
 
-    accum  = np.zeros((H_ref, W_ref, 3), dtype=np.float64)
-    weight = np.zeros((H_ref, W_ref),    dtype=np.float64)
-
-    # Seed with A1 itself
-    sharp_a1 = sharpness_weight(ref).astype(np.float64)
-    accum  += ref.astype(np.float64) * sharp_a1[..., np.newaxis]
-    weight += sharp_a1
+    frames_list  = [ref.astype(np.float32)]
+    weights_list = [sharpness_weight(ref).astype(np.float32)]
 
     # ── A-group: RAFT flow alignment ─────────────────────────────────────────
     print("\n--- A-group (RAFT optical flow) ---")
@@ -360,15 +647,32 @@ def fuse_frames(frames_dir: str, cal_path: str, output_path: str) -> str:
             print(f"  {cam}: missing, skip")
             continue
         print(f"  {cam} ...", end=' ', flush=True)
-        src     = load_frame_uint16(path)
+        src          = load_frame_uint16(path)
         warped, mask = align_raft(ref, src)
-        sharp        = sharpness_weight(warped).astype(np.float64)
-        w            = sharp * mask.astype(np.float64)
-        accum  += warped.astype(np.float64) * w[..., np.newaxis]
-        weight += w
+        warped = radiometric_normalize(warped.astype(np.float32), ref.astype(np.float32), mask)
+        sharp        = sharpness_weight(warped).astype(np.float32)
+        consist      = consistency_weight(ref, warped).astype(np.float32)
+        w            = sharp * mask.astype(np.float32) * consist
+        frames_list.append(warped.astype(np.float32))
+        weights_list.append(w)
         print("done")
 
-    # ── B-group: calibration + LightGlue alignment ───────────────────────────
+    # ── B-group: depth-map reprojection (or homography fallback) ────────────
+    # Try to load A1 depth map for B-camera reprojection.
+    # Expected path: <lumen_dir>/depth/A1.npz  (produced by Depth Pro).
+    depth_map_path = os.path.join(os.path.dirname(frames_dir.rstrip('/')),
+                                  'depth', 'A1.npz')
+    depth_map_a1 = None
+    if os.path.exists(depth_map_path):
+        depth_map_a1 = np.load(depth_map_path)['depth'].astype(np.float32)
+        # Resize to match ref frame if needed
+        if depth_map_a1.shape != (H_ref, W_ref):
+            depth_map_a1 = cv2.resize(depth_map_a1, (W_ref, H_ref),
+                                      interpolation=cv2.INTER_LINEAR)
+        print(f"  Depth map loaded: {depth_map_path}")
+    else:
+        print(f"  No depth map found, using homography fallback for B-group")
+
     print("\n--- B-group (homography + LightGlue) ---")
     cam_a1 = cameras.get('A1')
     for cam in B_CAMS:
@@ -380,22 +684,29 @@ def fuse_frames(frames_dir: str, cal_path: str, output_path: str) -> str:
             print(f"  {cam}: no calibration, skip")
             continue
         print(f"  {cam} ...", end=' ', flush=True)
-        src = load_frame_uint16(path)
+        src   = load_frame_uint16(path)
         cam_b = cameras[cam]
-        warped, mask = align_b_camera(ref, src, cam_a1, cam_b)
-        sharp        = sharpness_weight(warped).astype(np.float64)
-        w            = sharp * mask.astype(np.float64)
-        accum  += warped.astype(np.float64) * w[..., np.newaxis]
-        weight += w
+        warped, mask = align_b_camera(ref, src, cam_a1, cam_b,
+                                      depth_map=depth_map_a1)
+        warped = radiometric_normalize(warped.astype(np.float32), ref.astype(np.float32), mask)
+        # B-group CCM: correct spectral shift from periscope mirrors
+        ccm = estimate_ccm(warped, ref.astype(np.float32), mask)
+        if ccm is not None:
+            warped = apply_ccm(warped, ccm)
+        sharp        = sharpness_weight(warped).astype(np.float32)
+        consist      = consistency_weight(ref, warped).astype(np.float32)
+        w            = sharp * mask.astype(np.float32) * consist
+        frames_list.append(warped.astype(np.float32))
+        weights_list.append(w)
         print("done")
 
-    # ── Weighted average ──────────────────────────────────────────────────────
-    print("\nMerging ...", flush=True)
-    safe_w = np.where(weight > 0, weight, 1.0)
-    fused  = (accum / safe_w[..., np.newaxis]).clip(0, 65535).astype(np.float32)
+    # ── Laplacian pyramid blend ───────────────────────────────────────────────
+    print(f"\nBlending {len(frames_list)} frames with Laplacian pyramid ...", flush=True)
+    fused = laplacian_pyramid_blend(frames_list, weights_list)
 
-    # Where no camera contributed, fall back to A1
-    no_data = (weight == 0)
+    # Where no camera contributed any weight, fall back to A1
+    weight_sum = sum(w for w in weights_list)
+    no_data = (weight_sum == 0)
     fused[no_data] = ref[no_data]
 
     save_16bit_png(output_path, fused)

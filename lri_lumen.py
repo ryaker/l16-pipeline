@@ -43,6 +43,119 @@ def parse_args():
     return p.parse_args()
 
 
+# ── White balance estimation ──────────────────────────────────────────────────
+
+# Sensor median WB — used as last-resort fallback when image stats are
+# unreliable (too dark, heavily uniform, or clipped).
+_WB_SENSOR_R = 1.847
+_WB_SENSOR_B = 1.617
+
+
+def _wb_from_lumen_dng(frames_dir: str):
+    """
+    Try to find a Lumen DNG export for the same shot and read its
+    camera_whitebalance via rawpy.  Returns (R_gain, B_gain) or None.
+
+    Lumen stores AsShotNeutral as [r_recip, 1.0, b_recip]; rawpy returns
+    camera_whitebalance as [R, G, B, 0] already scaled so G≈1.0.
+    """
+    try:
+        import rawpy
+    except ImportError:
+        return None
+
+    # frames_dir is e.g. .../L16_02810_lumen/frames/
+    # Lumen DNGs typically live in .../L16IMAGES/Light/Export/<date>/L16_NNNNN.dng
+    # We look for a DNG that matches the LRI number embedded in the parent path.
+    import glob, re
+    parent = os.path.dirname(frames_dir.rstrip('/'))
+    base   = os.path.basename(parent)           # e.g. "L16_02810_lumen"
+    m = re.search(r'(L16_\d+)', base)
+    if not m:
+        return None
+    lri_stem = m.group(1)                       # "L16_02810"
+
+    # Search common Export folder locations relative to the LRI tree
+    search_roots = [
+        '/Volumes/L16IMAGES/Light/Export',
+        '/Volumes/Base Photos/Light/Export',
+    ]
+    for root in search_roots:
+        dngs = glob.glob(f'{root}/**/{lri_stem}.dng', recursive=True)
+        if dngs:
+            try:
+                with rawpy.imread(dngs[0]) as raw:
+                    wb = raw.camera_whitebalance   # [R, G, B, 0], G≈1
+                    g = wb[1] if wb[1] > 0 else 1.0
+                    r_gain = wb[0] / g
+                    b_gain = wb[2] / g
+                    if 0.8 < r_gain < 4.0 and 0.8 < b_gain < 4.0:
+                        return r_gain, b_gain
+            except Exception:
+                pass
+    return None
+
+
+def _wb_shade_of_grey(img_f: np.ndarray, p: float = 6.0):
+    """
+    Shade-of-Grey white balance (Finlayson & Trezzi 2004).
+
+    Equivalent to grey-world at p=1; approaches max-RGB as p→∞.
+    At p=6 the estimator is dominated by bright near-neutral pixels,
+    making it robust against coloured objects dominating the scene.
+
+    Operates on a linear float32 image [0..1], channels = R, G, B.
+    Returns (R_gain, B_gain) to make each channel equal to G.
+    """
+    # Exclude clipped highlights (>0.98) and pure shadow pixels (<0.005)
+    mask = (img_f[:, :, 1] > 0.005) & (img_f.max(axis=2) < 0.98)
+    if mask.sum() < 1000:
+        return None   # too few usable pixels
+
+    r = img_f[:, :, 0][mask]
+    g = img_f[:, :, 1][mask]
+    b = img_f[:, :, 2][mask]
+
+    r_norm = np.mean(r ** p) ** (1.0 / p)
+    g_norm = np.mean(g ** p) ** (1.0 / p)
+    b_norm = np.mean(b ** p) ** (1.0 / p)
+
+    if g_norm < 1e-6:
+        return None
+
+    r_gain = g_norm / r_norm if r_norm > 1e-6 else 1.0
+    b_gain = g_norm / b_norm if b_norm > 1e-6 else 1.0
+
+    # Sanity-clamp: if the scene is so unusual that gains would be extreme,
+    # fall back rather than over-correcting.
+    if not (0.6 < r_gain < 3.5 and 0.6 < b_gain < 3.5):
+        return None
+
+    return r_gain, b_gain
+
+
+def _estimate_wb(img_f: np.ndarray, frames_dir: str):
+    """
+    Return (R_gain, B_gain) using the best available method.
+
+    Priority: Lumen DNG → Shade-of-Grey p=6 → fixed sensor median.
+    """
+    result = _wb_from_lumen_dng(frames_dir)
+    if result:
+        r, b = result
+        print(f'  WB from Lumen DNG: R={r:.3f}  B={b:.3f}')
+        return r, b
+
+    result = _wb_shade_of_grey(img_f)
+    if result:
+        r, b = result
+        print(f'  WB from Shade-of-Grey p=6: R={r:.3f}  B={b:.3f}')
+        return r, b
+
+    print(f'  WB fallback (sensor median): R={_WB_SENSOR_R:.3f}  B={_WB_SENSOR_B:.3f}')
+    return _WB_SENSOR_R, _WB_SENSOR_B
+
+
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 def load_data(frames_dir: str, fused_dir: str):
@@ -72,15 +185,28 @@ def load_data(frames_dir: str, fused_dir: str):
     max_val = 65535.0 if img_rgb.dtype == np.uint16 else 255.0
     img_f = img_rgb.astype(np.float32) / max_val
 
-    # ── Grey-world auto white-balance ─────────────────────────────────────────
-    # L16 raw data has a strong green bias (G/R ≈ 1.6, G/B ≈ 1.3) inherited
-    # from the sensor's Bayer CFA.  Without correction the initial display
-    # looks greenish and WB sliders must be hand-tuned.  Applying grey-world
-    # here gives a neutral starting point; the WB sliders allow fine-tuning.
-    r_m, g_m, b_m = img_f[:, :, 0].mean(), img_f[:, :, 1].mean(), img_f[:, :, 2].mean()
-    if r_m > 1e-5 and b_m > 1e-5 and g_m > 1e-5:
-        img_f[:, :, 0] = np.clip(img_f[:, :, 0] * (g_m / r_m), 0, 1)
-        img_f[:, :, 2] = np.clip(img_f[:, :, 2] * (g_m / b_m), 0, 1)
+    # ── White balance ─────────────────────────────────────────────────────────
+    # Priority:
+    #   1. Lumen DNG export (same shot) → rawpy reads camera_whitebalance exactly.
+    #      Covers all images that have been through Lumen.  Best accuracy.
+    #   2. Shade-of-Grey (Minkowski p=6) on the linear image data.
+    #      Far better than grey-world (p=1): at p=6 the estimator is dominated by
+    #      bright near-neutral pixels (sky, concrete, white surfaces) rather than
+    #      the average hue of the whole scene.  A green garden doesn't push the
+    #      green channel because the BRIGHT pixels in the scene are near-neutral.
+    #      Fallback for new captures and images without a Lumen export.
+    #   3. Fixed sensor median (R=1.847, B=1.617) — last resort if the frame is
+    #      too dark or uniform to give reliable statistics.
+    WB_R, WB_B = _estimate_wb(img_f, frames_dir)
+    img_f[:, :, 0] = np.clip(img_f[:, :, 0] * WB_R, 0, 1)
+    img_f[:, :, 2] = np.clip(img_f[:, :, 2] * WB_B, 0, 1)
+
+    # ── Baseline exposure (+0.7 EV linear) ────────────────────────────────────
+    # The L16 sensor renders underexposed relative to Lumen's default output.
+    # This constant lift (applied in linear space, before gamma) matches the
+    # typical Lumen brightness.  The UI exposure slider provides per-scene
+    # fine-tuning on top of this baseline.
+    img_f = np.clip(img_f * (2.0 ** 1.0), 0, 1)
 
     # ── Gamma encode for display (linear → sRGB ≈ gamma 2.2) ─────────────────
     # The raw sensor data is linear-light.  Without gamma encoding the image
@@ -246,9 +372,11 @@ def apply_adjustments(img_rgb: np.ndarray,
     """
     img = img_rgb.astype(np.float32) / 255.0
 
-    # Exposure (in stops)
+    # Exposure (in stops, applied correctly in gamma-encoded space).
+    # The input is gamma 2.2, so to get true linear-light EV stops we must
+    # multiply by 2^(ev/2.2) rather than 2^ev.
     if exposure != 0.0:
-        img *= 2.0 ** exposure
+        img *= 2.0 ** (exposure / 2.2)
 
     # White balance
     img[:, :, 0] *= wb_r

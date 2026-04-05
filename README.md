@@ -8,14 +8,28 @@ The Light L16 captured 10 simultaneous RAW frames (5 wide + 5 tele) and used com
 
 ## Working On Now
 
-### Live tone sliders ✅ (just landed)
-Tone controls (exposure, contrast, highlights, shadows, WB, saturation, sharpness) now update the image in real time as you drag — no need to click "Apply Bokeh". The bokeh computation result is cached separately from the tone pass so live feedback is instant.
+### Multi-camera image fusion overhaul ✅ (just landed)
+Replaced the weighted-average accumulator in `lri_fuse_image.py` with a full multi-scale fusion pipeline:
 
-### 16-bit frame extraction ✅ (just landed)
-`lri_extract.py` was saving 8-bit PNG frames (10-bit data >> 2), which crushed dynamic range and made highlights/shadows sliders useless. Now saves 16-bit PNG (10-bit × 64 → uint16) so the full tonal range is available for adjustments.
+- **Laplacian pyramid blending** — 6-level pyramid blends low/high frequencies independently per camera at each scale. Eliminates the halo artifacts that weighted-average produced at depth edges. Weight maps are decomposed into their own Gaussian pyramids (level-matched), which is the mathematically correct approach.
+- **Radiometric normalization** — Before blending, each camera's gain and bias are estimated against the A1 reference using WLS (Weighted Least Squares) with inverse-gradient weighting. Edges are excluded from the gain estimate so color objects don't skew the result. Applied per-channel (R/G/B independently).
+- **B-group color correction matrix** — B-group cameras use periscope mirrors that introduce spectral shifts not present in the direct-firing A-group lenses. A 3×3 CCM is estimated per B-camera (least squares over overlap pixels) and applied before blending.
+- **Depth-map reprojection for B-cameras** — When a Depth Pro depth map is available (`depth/A1.npz`), B-cameras are aligned using true 3D warp (unproject via K_A⁻¹ → transform via R/t → reproject via K_B) rather than a global homography. Correctly handles depth-dependent parallax. Falls back to homography + LightGlue if depth map is absent.
+
+### White balance estimation overhaul ✅ (just landed)
+Three-tier WB in `lri_lumen.py`:
+1. Read from Lumen DNG export if available (most accurate)
+2. Shade-of-Grey estimator (p=6) on the actual image — robust to coloured scenes
+3. Sensor median fallback (R×1.847, B×1.617)
+
+### Live tone sliders ✅
+Tone controls (exposure, contrast, highlights, shadows, WB, saturation, sharpness) update in real time — bokeh result cached separately from tone pass.
+
+### 16-bit frame extraction ✅
+`lri_extract.py` saves 16-bit PNG (10-bit × 64 → uint16) so the full tonal range is available for adjustments.
 
 ### DNG Mylio/Lightroom compatibility (in test)
-Rewrote `export_dng()` to match the canonical camera DNG IFD layout: IFD0 = 8-bit sRGB thumbnail with all DNG metadata tags, SubIFD = full-res 16-bit LinearRaw. Previous version had the structure inverted. Luminar Neo confirmed working; Mylio testing in progress.
+IFD0 = 8-bit sRGB thumbnail + all DNG metadata tags, SubIFD = full-res 16-bit LinearRaw. Luminar Neo confirmed working; Mylio testing in progress.
 
 ---
 
@@ -23,13 +37,14 @@ Rewrote `export_dng()` to match the canonical camera DNG IFD layout: IFD0 = 8-bi
 
 | Feature | Notes |
 |---------|-------|
-| Per-camera color normalization | Each L16 camera has slightly different color response (G/R ratio varies 1.40–1.65). Normalize all cameras to the reference before fusion to fix color casts in multi-cam output. |
-| Laplacian pyramid blending | Replace weighted-average fusion with multi-scale pyramid blending (blend low/high frequencies separately). Eliminates halo artifacts at depth boundaries. |
-| Exposure fusion (Mertens style) | B4 camera shoots at ~½ the exposure of other cameras (HDR bracketed shot). Use it for highlight recovery in blown regions instead of discarding it. |
-| BAYER_JPEG extraction | 2018-06-26 LRI files use surface format 0 (4 half-res JPEGs per Bayer channel). Decoder spec in `L16-Pipeline-Spec.md`. Unblocks a large set of images. |
-| Better A-group SR | DBSR / RCAN learned super-resolution on the 5-camera A-group stack instead of straight weighted average. |
-| Real-ESRGAN upscale | 2× resolution post-fusion using Real-ESRGAN. |
-| HDR merge | Merge all 4 exposures per camera (Mertens / HDR-Transformer) instead of using only exposure 0. |
+| Per-channel radiometric normalization | Current WLS gain uses single luminance gain. Upgrade to per-channel R/G/B gain estimation to eliminate the residual pink/green cast visible in B-group contributions. |
+| Depth-map reprojection for B-cameras (with depth) | Depth map path exists and code is ready; needs Depth Pro run on A1 to produce `depth/A1.npz` before the 3D warp activates. Homography fallback is used until then. |
+| A-group IBP super-resolution | Iterative Back-Projection on the 5-camera A-group stack for sub-pixel resolution gain. Decision pending on Bayer vs RGB input path. |
+| Exposure fusion (Mertens style) | B4 camera shoots at ~½ the exposure of other cameras. Use for highlight recovery in blown regions. |
+| BAYER_JPEG extraction | 2018-06-26 LRI files use surface format 0 (4 half-res JPEGs per Bayer channel). Unblocks a large set of images. |
+| Real-ESRGAN upscale | 2× resolution post-fusion. |
+| DNG SubIFD export bug | Mylio shows horizontally mirrored flat image — SubIFD layout investigation deferred. |
+| Graph-Cut seam routing | Optimal seam placement at depth boundaries after depth reprojection stabilizes. |
 
 ---
 
@@ -135,10 +150,11 @@ Double-click any LRI in the browser panel to start processing. The pipeline cach
 
 | Script | Purpose |
 |--------|---------|
-| `lri_extract.py` | Unpack PACKED_10BPP Bayer, bilinear demosaic → per-camera PNGs |
+| `lri_extract.py` | Unpack PACKED_10BPP Bayer, bilinear demosaic → per-camera 16-bit PNGs |
 | `lri_calibration.py` | Parse LRI protobuf headers → camera intrinsics + extrinsics |
+| `lri_fuse_image.py` | Multi-camera image fusion: radiometric normalization, CCM, Laplacian pyramid blend, depth reprojection |
 | `lri_fuse_depth.py` | Reproject per-camera depth maps to reference frame, median fuse |
-| `lri_lumen.py` | Core algorithms: bokeh (CoC blur), tone adjustments, DNG export |
+| `lri_lumen.py` | Core algorithms: bokeh (CoC blur), tone adjustments, adaptive WB, DNG export |
 | `lri_lumen_app.py` | PySide6 desktop app — library browser + real-time editor |
 | `lri_depth_mps.py` | Multi-view depth fusion on Apple Silicon (MPS) |
 | `lri_depth_mlx.py` | Multi-view depth fusion using Apple MLX |
