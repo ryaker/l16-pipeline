@@ -211,12 +211,12 @@ class VirtualCamera:
         self.W = W_out
         self.H = H_out
 
-        # Position: prefer A1 as reference camera (matches Light.co architecture)
-        if 'A1' in cameras and cameras['A1'].get('t') is not None:
-            self.t = np.asarray(cameras['A1']['t'], dtype=np.float64).ravel()
-        else:
-            ts = [c['t'] for c in a_cams.values() if c.get('t') is not None]
-            self.t = np.mean(np.stack(ts, axis=0), axis=0) if ts else None
+        # Position: centroid of all 5 A cameras.
+        # The virtual camera represents the collective view of the A-group array,
+        # not any single camera.  Depth is built from all 5 using their inter-camera
+        # baselines; the centroid is the natural synthetic viewpoint.
+        ts = [c['t'] for c in a_cams.values() if c.get('t') is not None]
+        self.t = np.mean(np.stack(ts, axis=0), axis=0) if ts else None
 
     # ── Public interface ──────────────────────────────────────────────────────
 

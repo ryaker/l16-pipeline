@@ -291,37 +291,46 @@ def debayer_half(bayer: np.ndarray, pattern: int = 0) -> np.ndarray:
 def extract_metadata_from_header(hdr: ProtoReader) -> CaptureMetadata:
     """Extract image-level and device-level metadata from LightHeader proto."""
     meta = CaptureMetadata()
-    
+
     meta.image_id_low = hdr.get_uint64(1)
     meta.image_id_high = hdr.get_uint64(2)
     meta.focal_length_mm = hdr.get_int32(4)
-    
+
     ref_cam_id = hdr.get_uint32(5)
     meta.reference_camera = CAMERA_ID_NAMES.get(ref_cam_id, f"UNK{ref_cam_id}")
-    
+
     meta.device_model = hdr.get_string(8)
     meta.device_fw_version = hdr.get_string(9)
-    
+
     dev_temp_msg = hdr.get_message(11)
     if dev_temp_msg:
         meta.device_temperature_c = dev_temp_msg.get_float(1)
-    
-    vp_arr = hdr.get_message_array(19)
-    if vp_arr:
-        vp = vp_arr[0]
-        meta.awb_mode = vp.get_int64(7)
-        
-        awb_gains_arr = vp.get_message_array(15)
-        if awb_gains_arr:
-            ag = awb_gains_arr[0]
+
+    # AWB lives in field 19 (ViewPreferences) — may appear in any LELR block,
+    # not necessarily block 0. Field layout confirmed by proto field probe:
+    #   vp.f15 = ChannelGain message { f1=R, f2=Gr, f3=Gb, f4=B } (float32 each)
+    #   vp.f16 = awb_mode integer (0=AUTO)
+    vp = hdr.get_message(19)
+    if vp:
+        meta.awb_mode = vp.get_int32(16)
+        ag = vp.get_message(15)
+        if ag:
             meta.awb_gains = {
-                'r': ag.get_float(1),
-                'g_r': ag.get_float(2),
-                'g_b': ag.get_float(3),
-                'b': ag.get_float(4),
+                'R':   ag.get_float(1),
+                'Gr':  ag.get_float(2),
+                'Gb':  ag.get_float(3),
+                'B':   ag.get_float(4),
             }
-    
+
     return meta
+
+
+def _merge_awb(dst: CaptureMetadata, src: CaptureMetadata) -> None:
+    """Copy AWB fields from src into dst if dst doesn't have them yet."""
+    if dst.awb_gains is None and src.awb_gains is not None:
+        dst.awb_gains = src.awb_gains
+    if dst.awb_mode is None and src.awb_mode is not None:
+        dst.awb_mode = src.awb_mode
 
 
 # ── Main extraction with metadata ─────────────────────────────────────────────
@@ -354,12 +363,17 @@ def extract_modules(
         block_len, msg_offset, msg_len, msg_type = struct.unpack_from('<QQIB', data, offset + 4)
         if msg_type == MSG_TYPE_LIGHT and msg_len < 5_000_000:
             hdr = ProtoReader(data, offset + msg_offset, msg_len).parse()
-            
-            # Extract image-level metadata (update from first block only)
+
+            # Extract image-level metadata from every block so we don't miss
+            # fields that appear in later blocks (e.g. AWB gains in block 8).
+            block_meta = extract_metadata_from_header(hdr)
             if block_count == 0:
-                metadata = extract_metadata_from_header(hdr)
+                metadata = block_meta
+            else:
+                # Carry over AWB data from any later block that has it
+                _merge_awb(metadata, block_meta)
             block_count += 1
-            
+
             # Extract per-module metadata (field 12: CameraModule array)
             for mod_msg in hdr.get_message_array(12):
                 cam_id = mod_msg.get_uint64(2)
