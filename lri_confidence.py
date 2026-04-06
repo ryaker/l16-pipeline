@@ -123,14 +123,14 @@ def compute_confidence(
     # Smooth boundary falloff (used in both modes)
     taper = coverage_taper(coverage_mask)
 
-    if vc_mode == 'wide':
-        # Wide mode: taper only — equal weight for all cameras, let depth warp
-        # determine spatial contributions.
-        confidence = taper.copy()
-    else:
-        # Tele mode: res_w^8 strongly favours telephoto cameras.
-        res_w = resolution_weight(source_cam, virtual_cam)
-        confidence = taper * (res_w ** 8)
+    # Both wide and tele modes: favour cameras whose angular resolution matches
+    # the virtual canvas.  In wide mode the virtual canvas has fx≈8276 (B-camera
+    # density), so A cameras (fx≈3370) get res_w≈0.41 and B cameras get 1.0.
+    # res_w^8 gives B cameras ~1400× the weight of A cameras in their overlap
+    # region, eliminating the blurring caused by averaging 5 upsampled A frames
+    # against 1 native-resolution B frame.
+    res_w = resolution_weight(source_cam, virtual_cam)
+    confidence = taper * (res_w ** 8)
 
     # Zero out pixels outside coverage
     confidence[~coverage_mask] = 0.0

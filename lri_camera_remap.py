@@ -264,6 +264,7 @@ def apply_remap(
     src_image: np.ndarray,
     map_x: np.ndarray,
     map_y: np.ndarray,
+    interpolation: int = cv2.INTER_LINEAR,
 ) -> np.ndarray:
     """
     Warp src_image into the output canvas coordinate frame.
@@ -276,6 +277,10 @@ def apply_remap(
         Source column for each output pixel.
     map_y : np.ndarray, float32, shape (H_out, W_out)
         Source row for each output pixel.
+    interpolation : int
+        OpenCV interpolation flag.  Default INTER_LINEAR.
+        Use INTER_NEAREST for cameras mapped at ~1:1 scale (same focal length
+        as the virtual canvas) to preserve full source sharpness.
 
     Returns
     -------
@@ -284,7 +289,7 @@ def apply_remap(
     """
     return cv2.remap(
         src_image, map_x, map_y,
-        interpolation=cv2.INTER_LINEAR,
+        interpolation=interpolation,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
     )

@@ -22,6 +22,21 @@ from lri_camera_remap import compute_remap, apply_remap, load_remap_cache, cache
 from lri_confidence import compute_confidence
 from lri_ccm import estimate_ccm_from_cameras, apply_ccm
 from lri_depth_loader import forward_warp_depth, _load_raw_depth
+from lri_confidence import resolution_weight
+
+
+def _pick_interp(cam: dict, virtual_cam) -> int:
+    """
+    Choose cv2 interpolation flag for warping ``cam`` onto ``virtual_cam``.
+
+    When the source camera has the same angular resolution as the canvas
+    (resolution_weight ≥ 0.95, i.e. same focal length) the remap is
+    essentially 1:1 pixel-for-pixel.  INTER_NEAREST preserves full source
+    sharpness with no bilinear blur.  For lower-resolution cameras (wide
+    A-cameras warped onto a tele canvas) INTER_LINEAR avoids aliasing.
+    """
+    rw = resolution_weight(cam, virtual_cam)
+    return cv2.INTER_NEAREST if rw >= 0.95 else cv2.INTER_LINEAR
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +358,10 @@ def _assemble_tile(
         conf = compute_confidence(src_img, cam, tvc, mask, map_x, map_y)
 
         # 5. Warp source image to tile canvas space
-        warped = apply_remap(src_img.astype(np.float32), map_x, map_y)  # (H_tile, W_out, 3)
+        # Use INTER_NEAREST for same-resolution cameras (tele on tele canvas) to
+        # preserve full source sharpness; INTER_LINEAR otherwise to avoid aliasing.
+        warped = apply_remap(src_img.astype(np.float32), map_x, map_y,
+                             interpolation=_pick_interp(cam, tvc))  # (H_tile, W_out, 3)
 
         # 6. Accumulate weighted sum
         canvas += warped.astype(np.float64) * conf[:, :, None]
@@ -488,7 +506,8 @@ def assemble_canvas(
             conf = compute_confidence(src_img, cam, virtual_cam, mask, map_x, map_y)
 
             # 6. Warp source image to output canvas
-            warped = apply_remap(src_img.astype(np.float32), map_x, map_y)
+            warped = apply_remap(src_img.astype(np.float32), map_x, map_y,
+                                 interpolation=_pick_interp(cam, virtual_cam))
 
             # 7. Accumulate weighted sum
             canvas += warped.astype(np.float64) * conf[:, :, None]
