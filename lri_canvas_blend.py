@@ -492,6 +492,9 @@ def assemble_canvas(
     apply_ccm_flag: bool | None = None,  # deprecated alias for apply_wb_flag
     tile_rows=None,          # int or None; None = full-frame (single pass)
     lumen_dir: str = None,   # lumen directory for per-camera depth maps
+    focus_distance_m: float | None = None,  # calibrated focus plane (metres); when set,
+                             # all cameras use a flat depth plane at this distance —
+                             # pure geometry merge, no MVS / DepthPro required.
 ) -> np.ndarray:             # float32 (H_out, W_out, 3)
     """
     Assemble the virtual output canvas by warping and blending all cameras.
@@ -530,6 +533,15 @@ def assemble_canvas(
         forward-warped into the virtual camera canvas frame before being used
         in compute_remap.  This replaces the legacy resize-and-share approach
         that used A1's depth with A1's coordinate system for all cameras.
+    focus_distance_m : float or None
+        Calibrated focus plane distance in metres (read from LRI metadata,
+        converting from mm: ``focus_distance_m = hall_focus_mm / 1000``).
+        When provided, ALL cameras use a flat depth plane at this distance —
+        the merge becomes a pure geometry operation driven only by K, R, t
+        and the physical focus plane.  MVS and per-camera DepthPro maps are
+        NOT loaded.  This is the correct Light.co architecture: depth (scene
+        estimation) is used only for post-processing bokeh / re-focus, not
+        for the multi-camera pixel merge itself.
 
     Returns
     -------
@@ -560,16 +572,24 @@ def assemble_canvas(
         canvas = np.zeros((H_out, W_out, 3), dtype=np.float64)
         weight_sum = np.zeros((H_out, W_out), dtype=np.float64)
 
-        # Try to load a single MVS depth map covering all A cameras.
-        # When present it supersedes per-camera Depth Pro NPZ files for
-        # A1–A5, giving geometrically consistent metric depth in the
-        # virtual camera frame — no forward-warp needed.
-        mvs_depth = _load_mvs_depth(lumen_dir, virtual_cam)
-        if mvs_depth is not None:
-            print(f"  MVS depth detected — using mvs_a_cameras.npz for A cameras "
-                  f"(shape {mvs_depth.shape}, range "
-                  f"{mvs_depth[mvs_depth > 0].min():.1f}–{mvs_depth.max():.1f}m)",
-                  flush=True)
+        # Depth strategy (full-frame path):
+        #   focus_distance_m set  → flat plane at focus distance for ALL cameras
+        #                           (pure geometry merge; no MVS / DepthPro)
+        #   otherwise             → MVS map when available, else per-camera DepthPro
+        if focus_distance_m is not None:
+            from lri_depth_loader import flat_plane_depth
+            mvs_depth = None
+            _focus_plane = flat_plane_depth(virtual_cam, focus_distance_m)
+            print(f"  geometry merge: flat plane at {focus_distance_m:.3f}m "
+                  f"(no MVS / DepthPro)", flush=True)
+        else:
+            _focus_plane = None
+            mvs_depth = _load_mvs_depth(lumen_dir, virtual_cam)
+            if mvs_depth is not None:
+                print(f"  MVS depth detected — using mvs_a_cameras.npz for A cameras "
+                      f"(shape {mvs_depth.shape}, range "
+                      f"{mvs_depth[mvs_depth > 0].min():.1f}–{mvs_depth.max():.1f}m)",
+                      flush=True)
 
         # Preload all source images for homography computation and the main loop.
         print("  preloading source images (full-frame)...", flush=True)
@@ -590,7 +610,10 @@ def assemble_canvas(
             src_img = source_images_ff[cam_name]
 
             # Resolve per-camera canvas-space depth.
-            if cam_name[:1] == 'A' and mvs_depth is not None:
+            if _focus_plane is not None:
+                # Pure geometry merge: all cameras use the calibrated focus plane.
+                cam_depth = _focus_plane
+            elif cam_name[:1] == 'A' and mvs_depth is not None:
                 cam_depth = mvs_depth
             else:
                 _b_fixed_depth = (
@@ -655,36 +678,47 @@ def assemble_canvas(
         # mvs_a_cameras.npz is present, bypassing per-camera Depth Pro NPZ forward-warp.
         # B cameras: unchanged — per-camera Depth Pro NPZ or fixed 5.0m plane.
         print("  resolving per-camera depth maps...", flush=True)
-        mvs_depth = _load_mvs_depth(lumen_dir, virtual_cam)
-        if mvs_depth is not None:
-            valid_mvs = mvs_depth[mvs_depth > 0]
-            print(
-                f"  MVS depth detected — using mvs_a_cameras.npz for A cameras "
-                f"(shape {mvs_depth.shape}, range "
-                f"{valid_mvs.min():.1f}–{mvs_depth.max():.1f}m)",
-                flush=True,
-            )
-        per_cam_depth = {}
-        for cam_name, cam in cameras.items():
-            if cam_name not in source_images:
-                continue
-            if cam_name[:1] == 'A' and mvs_depth is not None:
-                # Use single MVS map directly for all A cameras — no forward-warp needed.
-                per_cam_depth[cam_name] = mvs_depth
-            else:
-                # B cameras (or A cameras when MVS unavailable): existing per-camera path.
-                # In wide mode, B cameras without a depth NPZ fall back to 5.0m rather
-                # than A1's depth (which is in a different coordinate system).
-                _b_fixed_depth = (
-                    5.0
-                    if (vc_mode == 'wide' and cam_name[:1] == 'B')
-                    else None
+        # Depth strategy (tiled path):
+        #   focus_distance_m set  → flat plane for ALL cameras (pure geometry merge)
+        #   otherwise             → MVS map when available, else per-camera DepthPro
+        if focus_distance_m is not None:
+            from lri_depth_loader import flat_plane_depth
+            _focus_plane = flat_plane_depth(virtual_cam, focus_distance_m)
+            print(f"  geometry merge: flat plane at {focus_distance_m:.3f}m "
+                  f"(no MVS / DepthPro)", flush=True)
+            per_cam_depth = {n: _focus_plane for n in source_images}
+        else:
+            _focus_plane = None
+            mvs_depth = _load_mvs_depth(lumen_dir, virtual_cam)
+            if mvs_depth is not None:
+                valid_mvs = mvs_depth[mvs_depth > 0]
+                print(
+                    f"  MVS depth detected — using mvs_a_cameras.npz for A cameras "
+                    f"(shape {mvs_depth.shape}, range "
+                    f"{valid_mvs.min():.1f}–{mvs_depth.max():.1f}m)",
+                    flush=True,
                 )
-                cam_depth = _resolve_depth_for_camera(
-                    cam_name, cam, virtual_cam, lumen_dir, depth_map,
-                    fixed_fallback_m=_b_fixed_depth,
-                )
-                per_cam_depth[cam_name] = cam_depth  # None → flat-plane; array → per-cam
+            per_cam_depth = {}
+            for cam_name, cam in cameras.items():
+                if cam_name not in source_images:
+                    continue
+                if cam_name[:1] == 'A' and mvs_depth is not None:
+                    # Use single MVS map directly for all A cameras — no forward-warp needed.
+                    per_cam_depth[cam_name] = mvs_depth
+                else:
+                    # B cameras (or A cameras when MVS unavailable): existing per-camera path.
+                    # In wide mode, B cameras without a depth NPZ fall back to 5.0m rather
+                    # than A1's depth (which is in a different coordinate system).
+                    _b_fixed_depth = (
+                        5.0
+                        if (vc_mode == 'wide' and cam_name[:1] == 'B')
+                        else None
+                    )
+                    cam_depth = _resolve_depth_for_camera(
+                        cam_name, cam, virtual_cam, lumen_dir, depth_map,
+                        fixed_fallback_m=_b_fixed_depth,
+                    )
+                    per_cam_depth[cam_name] = cam_depth  # None → flat-plane; array → per-cam
         n_with_depth = sum(1 for d in per_cam_depth.values() if d is not None)
         print(f"  depth: {n_with_depth}/{len(per_cam_depth)} cameras have per-camera depth",
               flush=True)
