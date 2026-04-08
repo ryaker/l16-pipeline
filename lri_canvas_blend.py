@@ -26,6 +26,219 @@ from lri_wb import apply_wb_exposure
 from lri_fuse_image import estimate_b_to_ref_homography
 
 
+# ---------------------------------------------------------------------------
+# Geometry-grounded color correction for B/C cameras
+# ---------------------------------------------------------------------------
+
+def _compute_b_to_a_color_correction(
+    b_img: np.ndarray,
+    a_img: np.ndarray,
+    b_cam: dict,
+    a_cam: dict,
+    depth_m: float,
+    n_grid: int = 50,
+) -> tuple[float, float, float]:
+    """
+    Compute per-channel color correction factors by projecting a regular grid
+    of B-camera pixels into the A-reference camera using K/R/t geometry at
+    a flat depth plane.
+
+    Parameters
+    ----------
+    b_img : np.ndarray  float32 (H, W, 3)   B camera source image
+    a_img : np.ndarray  uint16 or float32    A reference camera source image
+    b_cam : dict        B camera calibration (K, R, t in metres)
+    a_cam : dict        A reference camera calibration
+    depth_m : float     flat-plane depth in metres (focus distance)
+    n_grid : int        grid resolution per axis (n_grid × n_grid samples)
+
+    Returns
+    -------
+    (r_scale, g_scale, b_scale) : float
+        Multiply B image by these to match A1's colors in the overlap region.
+        Returns (1.0, 1.0, 1.0) if fewer than 100 valid overlap samples found.
+    """
+    H_b, W_b = b_img.shape[:2]
+    H_a, W_a = a_img.shape[:2]
+
+    K_b = b_cam['K'].astype(np.float64)
+    R_b = b_cam['R'].astype(np.float64)
+    t_b = b_cam['t'].astype(np.float64).ravel()
+    K_a = a_cam['K'].astype(np.float64)
+    R_a = a_cam['R'].astype(np.float64)
+    t_a = a_cam['t'].astype(np.float64).ravel()
+
+    # Sample a central grid of B pixels (avoid 15% border to skip lens vignette)
+    margin = 0.15
+    u_b = np.linspace(W_b * margin, W_b * (1 - margin), n_grid)
+    v_b = np.linspace(H_b * margin, H_b * (1 - margin), n_grid)
+    uu, vv = np.meshgrid(u_b, v_b)
+    u_flat = uu.ravel()
+    v_flat = vv.ravel()
+
+    # Unproject B pixels to 3-D at flat focus depth.
+    # Use mm throughout — camera t vectors are in mm (calibration.json convention).
+    depth_mm = depth_m * 1000.0
+
+    K_b_inv = np.linalg.inv(K_b)
+    ones = np.ones(len(u_flat))
+    uv1 = np.stack([u_flat, v_flat, ones], axis=-1)       # (N, 3)
+    ray_c = (K_b_inv @ uv1.T).T                           # (N, 3) camera-frame rays
+    P_c = depth_mm * ray_c / ray_c[:, 2:3]                # (N, 3) in mm
+
+    # B camera frame → world frame  (P_world = R_b^T * (P_c - t_b), units: mm)
+    P_world = (R_b.T @ (P_c - t_b).T).T                  # (N, 3)
+
+    # World → A camera frame → A pixel coords
+    P_a = (R_a @ P_world.T + t_a[:, None]).T              # (N, 3)
+    valid = P_a[:, 2] > 0.01
+    u_a = K_a[0, 0] * P_a[:, 0] / np.where(valid, P_a[:, 2], 1.0) + K_a[0, 2]
+    v_a = K_a[1, 1] * P_a[:, 1] / np.where(valid, P_a[:, 2], 1.0) + K_a[1, 2]
+
+    # Keep only samples inside both image bounds
+    pad = 8
+    valid &= (u_a >= pad) & (u_a < W_a - pad) & (v_a >= pad) & (v_a < H_a - pad)
+
+    if valid.sum() < 100:
+        return 1.0, 1.0, 1.0
+
+    ui_b = u_flat[valid].astype(np.int32)
+    vi_b = v_flat[valid].astype(np.int32)
+    ui_a = np.clip(u_a[valid].astype(np.int32), 0, W_a - 1)
+    vi_a = np.clip(v_a[valid].astype(np.int32), 0, H_a - 1)
+
+    b_pix = b_img[vi_b, ui_b].astype(np.float64)          # (N, 3)
+    a_pix = a_img.astype(np.float64)[vi_a, ui_a]          # (N, 3)
+
+    # Exclude clipped / black pixels in either image
+    b_lum = b_pix.mean(axis=1)
+    a_lum = a_pix.mean(axis=1)
+    good = (b_lum > 512) & (b_lum < 62000) & (a_lum > 512) & (a_lum < 62000)
+
+    if good.sum() < 50:
+        return 1.0, 1.0, 1.0
+
+    b_g = b_pix[good]
+    a_g = a_pix[good]
+
+    # Median per-channel ratio (robust to outlier pixel pairs)
+    r_scale = float(np.clip(np.median(a_g[:, 0] / np.maximum(b_g[:, 0], 1.0)),
+                            0.1, 10.0))
+    g_scale = float(np.clip(np.median(a_g[:, 1] / np.maximum(b_g[:, 1], 1.0)),
+                            0.1, 10.0))
+    b_scale = float(np.clip(np.median(a_g[:, 2] / np.maximum(b_g[:, 2], 1.0)),
+                            0.1, 10.0))
+
+    return r_scale, g_scale, b_scale
+
+
+def _compute_b_to_canvas_color_correction(
+    b_img: np.ndarray,
+    b_cam: dict,
+    virtual_cam,
+    reference_canvas: np.ndarray,
+    depth_m: float,
+    n_grid: int = 50,
+) -> tuple[float, float, float]:
+    """
+    Compute per-channel color correction using the pre-computed reference canvas
+    (e.g. the all-A canvas) rather than the A1 source image.
+
+    Projects B camera pixels forward to virtual canvas space, samples
+    ``reference_canvas`` at those positions, computes median per-channel ratio.
+
+    This is more accurate than ``_compute_b_to_a_color_correction`` when the
+    reference canvas is an all-A blend (5 cameras), because the 5-camera blend
+    gives a more complete and representative reference than A1 alone.
+
+    Parameters
+    ----------
+    b_img : np.ndarray  float32 (H, W, 3)   B camera source image
+    b_cam : dict        B camera calibration (K, R, t in mm)
+    virtual_cam         VirtualCamera with K, R, t, W, H attributes
+    reference_canvas : np.ndarray  float32 (H_vc, W_vc, 3)   all-A canvas
+    depth_m : float     flat-plane depth in metres
+    n_grid : int        grid resolution per axis
+
+    Returns
+    -------
+    (r_scale, g_scale, b_scale) : float
+        Multiply B image by these to match the reference canvas colors.
+    """
+    H_b, W_b = b_img.shape[:2]
+    H_vc, W_vc = reference_canvas.shape[:2]
+
+    K_b = b_cam['K'].astype(np.float64)
+    R_b = b_cam['R'].astype(np.float64)
+    t_b = b_cam['t'].astype(np.float64).ravel()
+
+    K_vc = virtual_cam.K.astype(np.float64)
+    # VirtualCamera has R=I (identity) by convention — no self.R attribute.
+    R_vc = np.eye(3, dtype=np.float64)
+    t_vc = (np.asarray(virtual_cam.t, dtype=np.float64).ravel()
+            if virtual_cam.t is not None else np.zeros(3))
+
+    depth_mm = depth_m * 1000.0
+
+    # Sample central grid of B pixels
+    margin = 0.15
+    u_b = np.linspace(W_b * margin, W_b * (1 - margin), n_grid)
+    v_b = np.linspace(H_b * margin, H_b * (1 - margin), n_grid)
+    uu, vv = np.meshgrid(u_b, v_b)
+    u_flat = uu.ravel()
+    v_flat = vv.ravel()
+
+    # B source pixel → 3-D at focus depth (mm)
+    K_b_inv = np.linalg.inv(K_b)
+    ones = np.ones(len(u_flat))
+    uv1 = np.stack([u_flat, v_flat, ones], axis=-1)
+    ray_c = (K_b_inv @ uv1.T).T
+    P_c = depth_mm * ray_c / ray_c[:, 2:3]
+
+    # B camera frame → world frame
+    P_world = (R_b.T @ (P_c - t_b).T).T
+
+    # World → virtual camera frame → canvas pixel
+    P_vc = (R_vc @ P_world.T + t_vc[:, None]).T
+    valid = P_vc[:, 2] > 0.01
+    u_vc = K_vc[0, 0] * P_vc[:, 0] / np.where(valid, P_vc[:, 2], 1.0) + K_vc[0, 2]
+    v_vc = K_vc[1, 1] * P_vc[:, 1] / np.where(valid, P_vc[:, 2], 1.0) + K_vc[1, 2]
+
+    pad = 8
+    valid &= (u_vc >= pad) & (u_vc < W_vc - pad) & (v_vc >= pad) & (v_vc < H_vc - pad)
+
+    if valid.sum() < 100:
+        return 1.0, 1.0, 1.0
+
+    ui_b = u_flat[valid].astype(np.int32)
+    vi_b = v_flat[valid].astype(np.int32)
+    ui_vc = np.clip(u_vc[valid].astype(np.int32), 0, W_vc - 1)
+    vi_vc = np.clip(v_vc[valid].astype(np.int32), 0, H_vc - 1)
+
+    b_pix = b_img[vi_b, ui_b].astype(np.float64)
+    ref_pix = reference_canvas[vi_vc, ui_vc].astype(np.float64)
+
+    # Exclude black/clipped/zero-weight pixels in the reference canvas
+    b_lum = b_pix.mean(axis=1)
+    ref_lum = ref_pix.mean(axis=1)
+    good = (b_lum > 512) & (b_lum < 62000) & (ref_lum > 512) & (ref_lum < 62000)
+
+    if good.sum() < 50:
+        return 1.0, 1.0, 1.0
+
+    b_g = b_pix[good]
+    ref_g = ref_pix[good]
+
+    r_scale = float(np.clip(np.median(ref_g[:, 0] / np.maximum(b_g[:, 0], 1.0)),
+                            0.1, 10.0))
+    g_scale = float(np.clip(np.median(ref_g[:, 1] / np.maximum(b_g[:, 1], 1.0)),
+                            0.1, 10.0))
+    b_scale = float(np.clip(np.median(ref_g[:, 2] / np.maximum(b_g[:, 2], 1.0)),
+                            0.1, 10.0))
+
+    return r_scale, g_scale, b_scale
+
+
 def _pick_interp(cam: dict, virtual_cam) -> int:
     """
     Choose cv2 interpolation flag for warping ``cam`` onto ``virtual_cam``.
@@ -495,6 +708,9 @@ def assemble_canvas(
     focus_distance_m: float | None = None,  # calibrated focus plane (metres); when set,
                              # all cameras use a flat depth plane at this distance —
                              # pure geometry merge, no MVS / DepthPro required.
+    reference_canvas: np.ndarray | None = None,  # pre-computed all-A canvas for
+                             # B-camera color correction; when provided, B cameras are
+                             # color-matched to this canvas rather than to A1 source.
 ) -> np.ndarray:             # float32 (H_out, W_out, 3)
     """
     Assemble the virtual output canvas by warping and blending all cameras.
@@ -600,8 +816,34 @@ def assemble_canvas(
                 continue
             src_img = load_image(frames_dir, cam_name)
             if apply_wb_flag and cam_name != ref_name:
-                src_img = apply_wb_exposure(src_img, cam, cameras[ref_name],
-                                            ref_img=ref_img)
+                is_b_cam = cam.get('mirror_type', 'NONE') != 'NONE'
+                if is_b_cam and focus_distance_m is not None:
+                    # Geometry-grounded overlap color correction.
+                    # r_s/g_s/b_s capture BOTH EV and sensor-color differences —
+                    # do NOT also apply exposure_ev_scale (double-counts EV).
+                    if reference_canvas is not None:
+                        # Two-pass mode: use the pre-computed all-A canvas as reference.
+                        # This accounts for all A cameras, not just A1's source image.
+                        r_s, g_s, b_s = _compute_b_to_canvas_color_correction(
+                            src_img.astype(np.float32), cam,
+                            virtual_cam, reference_canvas, focus_distance_m)
+                        method = 'canvas-ref'
+                    else:
+                        r_s, g_s, b_s = _compute_b_to_a_color_correction(
+                            src_img.astype(np.float32), ref_img,
+                            cam, cameras[ref_name], focus_distance_m)
+                        method = 'a1-ref'
+                    scale = np.array([r_s, g_s, b_s], dtype=np.float32)
+                    src_img = np.clip(src_img.astype(np.float32) * scale[None, None, :],
+                                      0.0, 65535.0).astype(np.float32)
+                    print(f"    {cam_name} overlap-correction ({method}): "
+                          f"R×{r_s:.3f} G×{g_s:.3f} B×{b_s:.3f}",
+                          flush=True)
+                else:
+                    # A cameras: EV-only (same sensor/scene — gray-world adds noise).
+                    src_img = apply_wb_exposure(src_img, cam, cameras[ref_name],
+                                                ref_img=ref_img,
+                                                use_gray_world=False)
             source_images_ff[cam_name] = src_img
 
         for cam_name, cam in cameras.items():
@@ -665,9 +907,34 @@ def assemble_canvas(
             src_img = load_image(frames_dir, cam_name)
             # Apply per-channel WB + exposure normalization (replaces CCM).
             # Skip for the reference camera itself.
+            # A cameras: EV-only (same sensor/scene — gray-world adds noise).
+            # B/C cameras: geometry-grounded overlap correction when focus_distance_m
+            #   is set; otherwise fall back to gray-world + EV.
             if apply_wb_flag and cam_name != ref_name:
-                src_img = apply_wb_exposure(src_img, cam, cameras[ref_name],
-                                            ref_img=ref_img)
+                is_b_cam = cam.get('mirror_type', 'NONE') != 'NONE'
+                if is_b_cam and focus_distance_m is not None:
+                    # r_s/g_s/b_s capture EV + sensor-color differences together.
+                    # Do NOT also apply exposure_ev_scale — that would double-count EV.
+                    if reference_canvas is not None:
+                        r_s, g_s, b_s = _compute_b_to_canvas_color_correction(
+                            src_img.astype(np.float32), cam,
+                            virtual_cam, reference_canvas, focus_distance_m)
+                        method = 'canvas-ref'
+                    else:
+                        r_s, g_s, b_s = _compute_b_to_a_color_correction(
+                            src_img.astype(np.float32), ref_img,
+                            cam, cameras[ref_name], focus_distance_m)
+                        method = 'a1-ref'
+                    scale = np.array([r_s, g_s, b_s], dtype=np.float32)
+                    src_img = np.clip(src_img.astype(np.float32) * scale[None, None, :],
+                                      0.0, 65535.0).astype(np.float32)
+                    print(f"    {cam_name} overlap-correction ({method}): "
+                          f"R×{r_s:.3f} G×{g_s:.3f} B×{b_s:.3f}",
+                          flush=True)
+                else:
+                    src_img = apply_wb_exposure(src_img, cam, cameras[ref_name],
+                                                ref_img=ref_img,
+                                                use_gray_world=is_b_cam)
             source_images[cam_name] = src_img
         active_cams = list(source_images.keys())
         print(f"  loaded {len(source_images)} cameras: {active_cams}", flush=True)
