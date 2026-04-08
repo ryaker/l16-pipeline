@@ -27,9 +27,11 @@ _A_CAMERAS = frozenset({'A1', 'A2', 'A3', 'A4', 'A5'})
 _B_CAMERAS = frozenset({'B1', 'B2', 'B3', 'B4', 'B5'})
 
 # Approximate focal length boundary between A (28mm) and B (70mm) cameras.
-# A cameras: fx≈3370 px; B cameras: fx≈8276 px.
+# A cameras: fx≈3370 px; B cameras: fx≈8276 px; C cameras: fx≈18000 px.
 # Anything below this threshold is treated as a wide/A camera.
+# Upper bound prevents C cameras (fx≈18000) from being misclassified as B.
 _WIDE_FX_THRESHOLD = 5000.0
+_B_FX_MAX = 14000.0   # C cameras (150mm) have fx > 15000; cap B-group here
 
 
 class VirtualCamera:
@@ -85,6 +87,11 @@ class VirtualCamera:
           FOV = union of A-group (wide) cameras.
           Pixel density = median B-group (telephoto) focal length.
           Position = centroid of A-camera translation vectors.
+
+        Fallback for shots that have no mirror_type='NONE' cameras (e.g.
+        B+C-only L16 configurations): split by focal length using the median
+        fx as the boundary.  Cameras below the median are treated as the
+        "wide" group; those above are treated as "tele".
         """
         # ── Separate wide and telephoto cameras ──────────────────────────────
         wide = {n: c for n, c in cameras.items()
@@ -93,7 +100,30 @@ class VirtualCamera:
                 if c.get('mirror_type', 'NONE') != 'NONE'}
 
         if not wide:
-            raise ValueError("No wide cameras (mirror_type='NONE') found.")
+            # No direct-fire (NONE) cameras — fall back to focal-length split.
+            # Use the median fx as the boundary: smaller-fx cameras are "wide",
+            # larger-fx cameras are "tele".  This handles B+C-only L16 shots
+            # where B-cameras (fx≈8280) act as the wide group and C-cameras
+            # (fx≈18400) act as the tele group.
+            all_fx = sorted(c['K'][0, 0] for c in cameras.values())
+            median_fx = float(np.median(all_fx))
+            wide = {n: c for n, c in cameras.items()
+                    if c['K'][0, 0] < median_fx}
+            tele = {n: c for n, c in cameras.items()
+                    if c['K'][0, 0] >= median_fx}
+            if not wide or not tele:
+                raise ValueError(
+                    "No wide cameras (mirror_type='NONE') found and focal-"
+                    "length split also failed — cannot build virtual camera."
+                )
+            import warnings
+            warnings.warn(
+                "No mirror_type='NONE' cameras found; using focal-length "
+                f"split (threshold fx={median_fx:.0f}) to separate wide "
+                f"({list(wide.keys())}) from tele ({list(tele.keys())}).",
+                stacklevel=3,
+            )
+
         if not tele:
             raise ValueError("No telephoto cameras found.")
 
@@ -160,7 +190,8 @@ class VirtualCamera:
         a_cams = {n: c for n, c in cameras.items()
                   if n in _A_CAMERAS or c['K'][0, 0] < _WIDE_FX_THRESHOLD}
         b_cams = {n: c for n, c in cameras.items()
-                  if n in _B_CAMERAS or c['K'][0, 0] >= _WIDE_FX_THRESHOLD}
+                  if n in _B_CAMERAS
+                  or _WIDE_FX_THRESHOLD <= c['K'][0, 0] <= _B_FX_MAX}
         if not a_cams:
             raise ValueError(
                 "No A-group cameras found for wide mode "

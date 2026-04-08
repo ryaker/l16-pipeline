@@ -332,7 +332,8 @@ def compute_movable_mirror_pose(
       C_virt = C_real − 2 d n
 
     Virtual rotation (world → cam), keeping det = +1:
-      R_virt = R_real · H · diag(−1, 1, 1)   → det = +1
+      R_virt = R_colmap · H · diag(−1, 1, 1)   → det = +1
+    where R_colmap = R_proto.T  (proto stores cam→world; COLMAP uses world→cam)
 
     Virtual translation (COLMAP convention X_cam = R t + t_col):
       t_virt = −R_virt · C_virt
@@ -355,7 +356,11 @@ def compute_movable_mirror_pose(
         return None, None
 
     C_real = parse_point3f(loc_msg)        # real camera centre in world (mm)
-    R_real = parse_matrix3x3(ori_msg)      # R_real: world → cam
+    # The MirrorSystem proto stores real_camera_orientation as a cam→world rotation
+    # (column vectors = world basis axes expressed in camera frame), i.e. the
+    # transpose of the COLMAP convention (world→cam).  Transpose to get R_colmap.
+    R_cam_to_world = parse_matrix3x3(ori_msg)
+    R_real = [[R_cam_to_world[j][i] for j in range(3)] for i in range(3)]  # world→cam
     axis   = parse_point3f(axis_msg)       # rotation axis (unit vector)
     pont   = parse_point3f(pont_msg)       # point on rotation axis
     n0     = parse_point3f(norm_msg)       # mirror normal at 0 °
@@ -386,6 +391,9 @@ def compute_movable_mirror_pose(
     R_H = _mat3_mul(R_real, H)
 
     # Apply diag(−1,1,1) on the right to restore det = +1  (flips image x-axis)
+    # NOTE: this left-right flip means the virtual sensor image has its x-axis
+    # mirrored vs the physical sensor.  Downstream code using K directly must set
+    # cx_eff = W − cx when projecting from virtual-camera to sensor coordinates.
     flip = [[-1,0,0],[0,1,0],[0,0,1]]
     R_virt = _mat3_mul(R_H, flip)
 
@@ -568,6 +576,7 @@ def parse_lri(path: str) -> Dict[str, Any]:
                 intrinsics_data['k_mat'] = mat
 
         # Find extrinsics bundle (hall_code = 0, field 3 present)
+        camera_location = None   # 3D world position of real lens centre (mm)
         for b in bundles:
             extr_msg = b.get_message(3)
             if extr_msg is None:
@@ -583,6 +592,14 @@ def parse_lri(path: str) -> Dict[str, Any]:
                     rotation_data = parse_matrix3x3(rot_msg)
                 if tra_msg:
                     translation_data = parse_point3f(tra_msg)
+                # Derive world position: C = -R^T @ t
+                if rotation_data and translation_data:
+                    R = rotation_data
+                    t = translation_data
+                    camera_location = [
+                        -sum(R[j][i] * t[j] for j in range(3))
+                        for i in range(3)
+                    ]
                 break
 
             # ── movable mirror ────────────────────────────────────────────────
@@ -594,6 +611,10 @@ def parse_lri(path: str) -> Dict[str, Any]:
                 if ms_msg and mam_msg:
                     rotation_data, translation_data = compute_movable_mirror_pose(
                         ms_msg, mam_msg, mirror_pos)
+                    # Extract real_camera_location directly (physical lens position)
+                    loc_msg = ms_msg.get_message(1)
+                    if loc_msg:
+                        camera_location = parse_point3f(loc_msg)
                 break
 
         if cam_id in module_info:
@@ -604,6 +625,7 @@ def parse_lri(path: str) -> Dict[str, Any]:
                 'intrinsics':     intrinsics_data,
                 'rotation':       rotation_data,
                 'translation':    translation_data,
+                'camera_location': camera_location,  # 3D world pos of real lens (mm)
             }
 
     return {

@@ -28,6 +28,7 @@ from PIL import Image as PILImage
 LELR_MAGIC     = b'LELR'
 HEADER_SIZE    = 32
 MSG_TYPE_LIGHT = 0
+MSG_TYPE_GPS   = 2
 
 CAMERA_ID_NAMES = {
     0: 'A1', 1: 'A2', 2: 'A3', 3: 'A4', 4: 'A5',
@@ -153,6 +154,15 @@ class ModuleCapture:
     sensor_flip_v: bool = False
 
 @dataclass
+class GPSData:
+    """GPS fix embedded in MSG_TYPE 2 block."""
+    latitude: float = 0.0
+    longitude: float = 0.0
+    timestamp_s: int = 0          # Unix timestamp (seconds)
+    altitude_m: Optional[float] = None
+    accuracy_m: Optional[float] = None
+
+@dataclass
 class CaptureMetadata:
     """Complete capture metadata for an LRI image."""
     image_id_low: int = 0
@@ -164,7 +174,62 @@ class CaptureMetadata:
     device_temperature_c: Optional[float] = None
     awb_mode: Optional[int] = None
     awb_gains: Optional[Dict[str, float]] = None
+    gps: Optional[GPSData] = None
     modules: Dict[str, ModuleCapture] = field(default_factory=dict)
+
+
+# ── GPS parsing ──────────────────────────────────────────────────────────────
+
+def parse_gps_block(msg_data: bytes) -> GPSData:
+    """
+    Parse GPSData protobuf (MSG_TYPE 2).
+
+    Field layout (inferred from binary analysis):
+      1: double  latitude  (degrees, WGS84)
+      2: double  longitude (degrees, WGS84)
+      3: varint  timestamp_s (Unix seconds)
+      7: message { 1: double accuracy_m }
+      5: message { 1: double altitude_m }
+    """
+    gps = GPSData()
+    pr = ProtoReader(msg_data).parse()
+
+    # latitude / longitude stored as 64-bit IEEE 754 doubles (wire type 1)
+    f1 = pr.fields.get(1)
+    if f1:
+        raw = struct.pack('<Q', int(f1[0]))
+        gps.latitude = struct.unpack('<d', raw)[0]
+
+    f2 = pr.fields.get(2)
+    if f2:
+        raw = struct.pack('<Q', int(f2[0]))
+        gps.longitude = struct.unpack('<d', raw)[0]
+
+    f3 = pr.fields.get(3)
+    if f3:
+        gps.timestamp_s = int(f3[0])
+
+    # Sub-message field 5: altitude { double altitude_m = 1 }
+    alt_msg = pr.get_message(5)
+    if alt_msg:
+        f = alt_msg.fields.get(1)
+        if f:
+            raw = struct.pack('<Q', int(f[0]))
+            val = struct.unpack('<d', raw)[0]
+            if val != 0.0:
+                gps.altitude_m = val
+
+    # Sub-message field 7: accuracy { double accuracy_m = 1 }
+    acc_msg = pr.get_message(7)
+    if acc_msg:
+        f = acc_msg.fields.get(1)
+        if f:
+            raw = struct.pack('<Q', int(f[0]))
+            val = struct.unpack('<d', raw)[0]
+            if val > 0.0:
+                gps.accuracy_m = val
+
+    return gps
 
 
 # ── Raw Bayer decoding (from original lri_extract.py) ────────────────────────
@@ -345,6 +410,7 @@ def extract_modules_with_metadata(
 
     # Initialize metadata container
     metadata = CaptureMetadata()
+    _gps: Optional[GPSData] = None  # collected separately; assigned after all LIGHT headers
 
     # Walk LELR blocks and collect module descriptors
     modules = {}   # camera_id → {name, width, height, stride, abs_data_offset, format, bayer}
@@ -353,10 +419,14 @@ def extract_modules_with_metadata(
         if data[offset:offset+4] != LELR_MAGIC:
             break
         block_len, msg_offset, msg_len, msg_type = struct.unpack_from('<QQIB', data, offset + 4)
+        if msg_type == MSG_TYPE_GPS and 0 < msg_len < 1_000_000:
+            gps_raw = data[offset + msg_offset : offset + msg_offset + msg_len]
+            _gps = parse_gps_block(gps_raw)
+
         if msg_type == MSG_TYPE_LIGHT and msg_len < 5_000_000:
             hdr = ProtoReader(data, offset + msg_offset, msg_len).parse()
-            
-            # Extract image-level and device metadata
+
+            # Extract image-level and device metadata (creates new CaptureMetadata)
             metadata = extract_metadata_from_header(hdr)
             
             # Extract per-module capture settings (field 12: CameraModule array)
@@ -426,6 +496,10 @@ def extract_modules_with_metadata(
                         }
         
         offset += block_len
+
+    # Attach GPS (may have been parsed before or after the LIGHT header block)
+    if _gps is not None:
+        metadata.gps = _gps
 
     written = []
     for cam_id in sorted(modules):
@@ -538,6 +612,7 @@ def main():
             'device_temperature_c': metadata.device_temperature_c,
             'awb_mode': metadata.awb_mode,
             'awb_gains': metadata.awb_gains,
+            'gps': asdict(metadata.gps) if metadata.gps else None,
             'modules': {
                 name: asdict(mod) for name, mod in metadata.modules.items()
             },

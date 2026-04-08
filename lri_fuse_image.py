@@ -54,7 +54,21 @@ DEVICE = _device()
 # ── calibration ──────────────────────────────────────────────────────────────
 
 def load_cameras(cal_path: str) -> dict:
-    """Load camera intrinsics + extrinsics from calibration.json."""
+    """Load camera intrinsics + extrinsics (and exposure/WB metadata) from calibration.json.
+
+    In addition to optical parameters (K, R, t), each camera entry now also
+    carries radiometric metadata needed for white-balance and exposure
+    normalization:
+
+      ``analog_gain``   — ISP analogue gain factor at capture time (float).
+      ``exposure_ns``   — Sensor integration time in nanoseconds (int).
+      ``bayer_pattern`` — Bayer CFA layout: 0=RGGB, 1=GRBG, 2=GBRG, 3=BGGR,
+                          -1=monochrome.
+
+    These fields are present in calibration.json when it was produced by
+    lri_calibration.py.  If absent (e.g. legacy JSON) the keys are omitted from
+    the camera dict so callers can use .get() safely.
+    """
     data = json.load(open(cal_path))
     cameras = {}
     for mod in data['modules']:
@@ -66,13 +80,26 @@ def load_cameras(cal_path: str) -> dict:
         K = np.array([[intr['fx'], 0,          intr['cx']],
                       [0,          intr['fy'],  intr['cy']],
                       [0,          0,           1        ]], dtype=np.float64)
-        cameras[name] = dict(
+        mt = cal.get('mirror_type', 'NONE')
+        entry = dict(
             K=K,
             R=np.array(cal['rotation'],    dtype=np.float64) if cal.get('rotation') else None,
             t=np.array(cal['translation'], dtype=np.float64) if cal.get('translation') else None,
             W=mod['width'], H=mod['height'],
-            mirror_type=cal.get('mirror_type', 'NONE'),
+            mirror_type=mt,
+            # MOVABLE virtual pose includes diag(-1,1,1) x-flip; compute_remap must
+            # undo this to get physical sensor pixel coordinates.
+            virt_mirror_x=(mt == 'MOVABLE'),
         )
+        # Radiometric metadata — present when calibration.json was produced by
+        # lri_calibration.py; silently absent for older JSON files.
+        if 'analog_gain' in mod:
+            entry['analog_gain'] = float(mod['analog_gain'])
+        if 'exposure_ns' in mod:
+            entry['exposure_ns'] = int(mod['exposure_ns'])
+        if 'bayer_pattern' in mod:
+            entry['bayer_pattern'] = int(mod['bayer_pattern'])
+        cameras[name] = entry
     return cameras
 
 
@@ -735,6 +762,87 @@ def _lightglue_refine(ref: np.ndarray, src: np.ndarray) -> np.ndarray | None:
         return None
 
     return H_ref
+
+
+def estimate_b_to_ref_homography(
+    ref: np.ndarray,
+    src: np.ndarray,
+    cam_ref: dict | None = None,
+    cam_src: dict | None = None,
+) -> np.ndarray | None:
+    """
+    Estimate 3×3 homography mapping src (B-camera) pixels → ref (A1) pixels.
+
+    Uses SuperPoint + LightGlue.  When the B camera has a longer focal length
+    than the A1 reference (typical: fx_b ≈ 2–3× fx_a1) a scale-normalised
+    fallback is attempted: src is resized to approximately A1's angular scale
+    before matching, and the homography is adjusted back to raw-src space.
+
+    Parameters
+    ----------
+    ref, src   : float32 (H, W, 3) in [0..65535]
+    cam_ref    : camera dict with key 'K' (3×3 intrinsic) for the ref camera
+    cam_src    : camera dict with key 'K' (3×3 intrinsic) for the src camera
+
+    Returns
+    -------
+    3×3 float64 homography (src_pixel → ref_pixel), or None on failure.
+    """
+    # Try direct full-resolution match
+    H = _lightglue_refine(ref, src)
+    if H is not None:
+        return H
+
+    # Scale-normalised fallback — resize src so scene features appear the same
+    # angular size as in ref.  Needed when fx_src ≫ fx_ref.
+    fx_ref = cam_ref['K'][0, 0] if cam_ref is not None else None
+    fx_src = cam_src['K'][0, 0] if cam_src is not None else None
+    scale = (fx_ref / fx_src) if (fx_ref and fx_src and fx_src > fx_ref) else None
+    if scale is not None and scale < 0.95:
+        H_h, W_w = src.shape[:2]
+        sw_s = max(64, int(W_w * scale))
+        sh_s = max(64, int(H_h * scale))
+
+        # For very high zoom cameras (C cameras, scale ≈ 0.18), downscaling src to
+        # ~762×571 px is too small for reliable LightGlue matching.  Instead, crop
+        # the corresponding central region of ref and upscale it to src resolution,
+        # then match at full resolution.  The homography is mapped back to full-ref
+        # coordinates after matching.
+        if sw_s < 1024 and cam_ref is not None:
+            H_ref_img, W_ref_img = ref.shape[:2]
+            cx_ref = cam_ref['K'][0, 2]
+            cy_ref = cam_ref['K'][1, 2]
+            # Crop size in ref pixels = src_size * scale, plus 30% padding
+            pad_w = max(60, int(sw_s * 0.30))
+            pad_h = max(60, int(sh_s * 0.30))
+            crop_w = sw_s + 2 * pad_w
+            crop_h = sh_s + 2 * pad_h
+            u0 = max(0, int(cx_ref - crop_w / 2))
+            v0 = max(0, int(cy_ref - crop_h / 2))
+            u1 = min(W_ref_img, u0 + crop_w)
+            v1 = min(H_ref_img, v0 + crop_h)
+            ref_crop = ref[v0:v1, u0:u1]
+            # Upscale ref crop to src resolution for matched-scale matching
+            ref_crop_up = cv2.resize(ref_crop, (W_w, H_h), interpolation=cv2.INTER_LINEAR)
+            H_src_to_up = _lightglue_refine(ref_crop_up, src)
+            if H_src_to_up is not None:
+                # Convert crop_upscaled coords → full ref coords:
+                #   crop_up → crop_original: multiply by ((u1-u0)/W_w, (v1-v0)/H_h)
+                #   crop_original → full ref: add (u0, v0)
+                sx = (u1 - u0) / W_w
+                sy = (v1 - v0) / H_h
+                S_down = np.array([[sx, 0., 0.], [0., sy, 0.], [0., 0., 1.]])
+                T_off  = np.array([[1., 0., u0], [0., 1., v0], [0., 0., 1.]])
+                return T_off @ S_down @ H_src_to_up
+
+        src_scaled = cv2.resize(src, (sw_s, sh_s), interpolation=cv2.INTER_AREA)
+        H_scaled = _lightglue_refine(ref, src_scaled)
+        if H_scaled is not None:
+            # Map: raw_src →[S]→ scaled_src →[H_scaled]→ ref
+            S = np.diag([scale, scale, 1.0])
+            return H_scaled @ S
+
+    return None
 
 
 # ── radiometric normalization ────────────────────────────────────────────────

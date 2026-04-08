@@ -20,9 +20,10 @@ import cv2
 
 from lri_camera_remap import compute_remap, apply_remap, load_remap_cache, cache_remap
 from lri_confidence import compute_confidence
-from lri_ccm import estimate_ccm_from_cameras, apply_ccm
 from lri_depth_loader import forward_warp_depth, _load_raw_depth
 from lri_confidence import resolution_weight
+from lri_wb import apply_wb_exposure
+from lri_fuse_image import estimate_b_to_ref_homography
 
 
 def _pick_interp(cam: dict, virtual_cam) -> int:
@@ -173,8 +174,16 @@ def _select_ref_camera(cameras: dict) -> str:
 
     Falls back to the first wide camera if only one exists or translations
     are missing.
+
+    If no mirror_type='NONE' cameras exist (e.g. B+C-only L16 shots), falls
+    back to the camera with the smallest focal length (widest FOV).
     """
     wide = {n: c for n, c in cameras.items() if c.get('mirror_type', 'NONE') == 'NONE'}
+    if not wide:
+        # Focal-length fallback: treat smallest-fx cameras as the wide group.
+        all_fx = sorted(c['K'][0, 0] for c in cameras.values())
+        median_fx = float(np.median(all_fx))
+        wide = {n: c for n, c in cameras.items() if c['K'][0, 0] < median_fx}
     if not wide:
         raise ValueError("No wide cameras (mirror_type='NONE') found in cameras dict.")
     if len(wide) == 1:
@@ -269,6 +278,108 @@ def _resolve_depth_for_camera(
 
 
 # ---------------------------------------------------------------------------
+# Homography-based remap helper (MOVABLE B cameras)
+# ---------------------------------------------------------------------------
+
+def _remap_from_homography(
+    H_vc_to_b: np.ndarray,
+    row_start: int,
+    H_tile: int,
+    W_out: int,
+    cam: dict,
+) -> tuple:
+    """
+    Generate remap arrays from a virtual-canvas → B-camera homography.
+
+    Parameters
+    ----------
+    H_vc_to_b : 3×3 float64 — maps vc pixel (u_global, v_global) → B pixel
+    row_start  : first row of this tile in global virtual-canvas coordinates
+    H_tile     : height of tile in rows
+    W_out      : width of virtual canvas
+    cam        : camera dict (needs 'W', 'H')
+
+    Returns
+    -------
+    map_x, map_y : float32 (H_tile, W_out) — B-camera pixel coordinates
+    mask         : bool   (H_tile, W_out) — True where within B-sensor bounds
+    """
+    us = np.arange(W_out, dtype=np.float64)
+    vs = np.arange(row_start, row_start + H_tile, dtype=np.float64)
+    uu, vv = np.meshgrid(us, vs)                             # (H_tile, W_out)
+    N = H_tile * W_out
+    pts = np.stack([uu.ravel(), vv.ravel(), np.ones(N)], axis=1).T  # (3, N)
+    pts_b = H_vc_to_b @ pts
+    # Perspective divide (guard against near-zero w)
+    w = pts_b[2:3, :]
+    w = np.where(np.abs(w) > 1e-8, w, 1e-8)
+    pts_b = pts_b / w
+    map_x = pts_b[0].reshape(H_tile, W_out).astype(np.float32)
+    map_y = pts_b[1].reshape(H_tile, W_out).astype(np.float32)
+    mask = (
+        (map_x >= 2.0) & (map_x <= cam['W'] - 2) &
+        (map_y >= 2.0) & (map_y <= cam['H'] - 2)
+    )
+    return map_x, map_y, mask
+
+
+def _compute_movable_homographies(
+    cameras: dict,
+    source_images: dict,          # {cam_name: uint16 ndarray} — already WB-corrected
+    ref_name: str,
+    virtual_cam,
+) -> dict:
+    """
+    For every MOVABLE B camera present in source_images, run LightGlue against
+    the reference A camera to obtain a virtual-canvas → B-sensor homography.
+
+    Returns
+    -------
+    dict mapping cam_name → H_vc_to_b (3×3 float64), or empty dict on failure.
+    """
+    import warnings
+
+    result = {}
+    ref_img_f32 = source_images.get(ref_name)
+    if ref_img_f32 is None:
+        warnings.warn(f"Reference camera {ref_name} not in source_images; "
+                      "cannot compute MOVABLE homographies.")
+        return result
+    ref_img_f32 = ref_img_f32.astype(np.float32)
+
+    K_ref = cameras[ref_name]['K'].astype(np.float64)
+    K_vc  = virtual_cam.K.astype(np.float64)
+    # S maps ref-camera pixels to virtual-canvas pixels
+    S = K_vc @ np.linalg.inv(K_ref)
+
+    for cam_name, cam in cameras.items():
+        if cam.get('mirror_type') != 'MOVABLE':
+            continue
+        if cam_name not in source_images:
+            continue
+        print(f"  LightGlue homography for {cam_name}...", end=' ', flush=True)
+        try:
+            b_img_f32 = source_images[cam_name].astype(np.float32)
+            H_b_to_ref = estimate_b_to_ref_homography(
+                ref_img_f32, b_img_f32,
+                cam_ref=cameras[ref_name], cam_src=cam,
+            )
+            if H_b_to_ref is None:
+                print("FAILED (no matches)", flush=True)
+                continue
+            # H_b_to_vc = S @ H_b_to_ref maps B pixel → vc pixel
+            H_b_to_vc = S @ H_b_to_ref
+            H_vc_to_b = np.linalg.inv(H_b_to_vc)
+            H_vc_to_b /= H_vc_to_b[2, 2]
+            result[cam_name] = H_vc_to_b
+            print("OK", flush=True)
+        except Exception as exc:
+            print(f"ERROR ({exc})", flush=True)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Core assembly — single tile
 # ---------------------------------------------------------------------------
 
@@ -315,32 +426,26 @@ def _assemble_tile(
         if cam_name not in source_images:
             continue
 
-        # Skip movable-mirror cameras in tele mode: their factory calibration R
-        # is stale (mirror shifted post-calibration), so compute_remap gives
-        # wrong coords.  These cameras need LightGlue image-based alignment.
-        # In wide mode we include them (after a one-time warning) because the
-        # B cameras contribute additional resolution; depth-guided warping
-        # compensates for coarse alignment errors.
-        if cam.get('mirror_type', 'NONE') == 'MOVABLE':
-            if vc_mode != 'wide':
-                continue
-            # Wide mode: emit one-time warning per camera then proceed.
-            import warnings
-            warnings.warn(
-                f"Camera {cam_name} has a MOVABLE mirror — factory R calibration "
-                "may be stale. Alignment in wide mode may be imperfect.",
-                stacklevel=2,
-            )
+        # Quick ROI pre-screen: skip this camera entirely if its canvas-space
+        # bounding box doesn't overlap the current tile row range.  This is
+        # especially valuable for telephoto cameras (C cameras cover ~4% of the
+        # wide canvas) which only appear in a few of the 18 tiles.
+        from lri_camera_remap import _camera_canvas_roi
+        _, roi_y0, _, roi_y1 = _camera_canvas_roi(virtual_cam, cam)
+        if roi_y0 >= row_end or roi_y1 <= row_start:
+            continue  # This camera has no coverage in this tile row range
 
-        # 1. Source image already loaded and CCM-corrected
+        # 1. Source image already loaded and WB-corrected
         src_img = source_images[cam_name]
 
-        # 2. Slice this camera's depth to the current tile (or None for flat-plane)
+        # 2. Remap generation — all cameras use calibration-based compute_remap.
+        #    MOVABLE cameras have correct virtual poses after the convention fix
+        #    in compute_movable_mirror_pose (R_proto transposed to COLMAP).
+        # 2a. Slice this camera's depth to the current tile (or None)
         cam_depth = per_cam_depth.get(cam_name)
         depth_tile = cam_depth[row_start:row_end, :] if cam_depth is not None else None
 
-        # 3. Load or compute remap for this tile
-        # Cache key encodes tile extents so different tiles don't collide.
+        # 2b. Load or compute remap for this tile
         tile_suffix = f'{cam_name}_tile_{row_start}_{row_end}'
         map_x, map_y, mask = None, None, None
         if remap_cache_dir:
@@ -354,10 +459,10 @@ def _assemble_tile(
                 os.makedirs(remap_cache_dir, exist_ok=True)
                 cache_remap(remap_cache_dir, tile_suffix, map_x, map_y, mask)
 
-        # 4. Compute confidence map (H_tile, W_out)
+        # 3. Compute confidence map (H_tile, W_out)
         conf = compute_confidence(src_img, cam, tvc, mask, map_x, map_y)
 
-        # 5. Warp source image to tile canvas space
+        # 4. Warp source image to tile canvas space
         # Use INTER_NEAREST for same-resolution cameras (tele on tele canvas) to
         # preserve full source sharpness; INTER_LINEAR otherwise to avoid aliasing.
         warped = apply_remap(src_img.astype(np.float32), map_x, map_y,
@@ -383,7 +488,8 @@ def assemble_canvas(
     virtual_cam,             # VirtualCamera
     depth_map,               # float32 (H_out, W_out) metres, or None (legacy fallback)
     remap_cache_dir=None,    # path to cache remap arrays, or None
-    apply_ccm_flag: bool = True,
+    apply_wb_flag: bool = True,
+    apply_ccm_flag: bool | None = None,  # deprecated alias for apply_wb_flag
     tile_rows=None,          # int or None; None = full-frame (single pass)
     lumen_dir: str = None,   # lumen directory for per-camera depth maps
 ) -> np.ndarray:             # float32 (H_out, W_out, 3)
@@ -395,7 +501,9 @@ def assemble_canvas(
     frames_dir : str
         Directory containing ``<cam_name>.png`` files.
     cameras : dict
-        Camera dict (K, R, t, W, H, mirror_type) keyed by camera name.
+        Camera dict (K, R, t, W, H, mirror_type, analog_gain, exposure_ns)
+        keyed by camera name.  Exposure/gain fields are produced by
+        ``load_cameras()`` from lri_fuse_image.py.
     virtual_cam : VirtualCamera
         Target projection (defines H_out, W_out, K).
     depth_map : np.ndarray or None
@@ -404,10 +512,15 @@ def assemble_canvas(
         back to flat-plane inside compute_remap.
     remap_cache_dir : str or None
         Directory for caching remap arrays (.npz).  ``None`` disables caching.
-    apply_ccm_flag : bool
-        Apply Colour-Correction Matrix to mirror cameras (GLUED / MOVABLE).
-        The CCM is now exposure-neutral (chromaticity-only) so this is safe to
-        leave enabled — it will no longer reduce B4's sharpness.
+    apply_wb_flag : bool
+        Apply per-camera white-balance and exposure normalization before
+        warping.  Uses gray-world WB gains relative to the reference camera
+        and exposure_ns * analog_gain to compute EV offsets.
+        No cross-channel mixing — purely three independent scale factors.
+    apply_ccm_flag : bool or None
+        Deprecated.  When set, overrides ``apply_wb_flag`` for backward
+        compatibility with callers that used the old CCM interface.  The CCM
+        has been replaced by the simpler per-channel WB+exposure normalization.
     tile_rows : int or None
         Number of output rows per processing tile.  ``None`` processes the
         entire canvas in one pass (~1.8 GB RAM for 10449×7795).  Use e.g.
@@ -423,10 +536,20 @@ def assemble_canvas(
     np.ndarray
         Float32 (H_out, W_out, 3) fused canvas in uint16 intensity scale.
     """
+    # Backward-compat: apply_ccm_flag was the old parameter name
+    if apply_ccm_flag is not None:
+        import warnings
+        warnings.warn(
+            "apply_ccm_flag is deprecated; use apply_wb_flag instead. "
+            "The CCM has been replaced by per-channel WB+exposure normalization.",
+            DeprecationWarning, stacklevel=2,
+        )
+        apply_wb_flag = bool(apply_ccm_flag)
+
     H_out = virtual_cam.H
     W_out = virtual_cam.W
 
-    # Identify reference wide camera for CCM estimation
+    # Identify reference wide camera for WB normalization
     ref_name = _select_ref_camera(cameras)
     ref_img = load_image(frames_dir, ref_name)  # uint16
 
@@ -448,35 +571,25 @@ def assemble_canvas(
                   f"{mvs_depth[mvs_depth > 0].min():.1f}–{mvs_depth.max():.1f}m)",
                   flush=True)
 
+        # Preload all source images for homography computation and the main loop.
+        print("  preloading source images (full-frame)...", flush=True)
+        source_images_ff = {}
         for cam_name, cam in cameras.items():
-            # Skip movable-mirror cameras in tele mode.
-            # In wide mode, include them with a warning (stale R calibration).
-            if cam.get('mirror_type', 'NONE') == 'MOVABLE':
-                if vc_mode != 'wide':
-                    continue
-                import warnings
-                warnings.warn(
-                    f"Camera {cam_name} has a MOVABLE mirror — factory R calibration "
-                    "may be stale. Alignment in wide mode may be imperfect.",
-                    stacklevel=2,
-                )
             frame_path = os.path.join(frames_dir, f'{cam_name}.png')
             if not os.path.exists(frame_path):
                 continue
+            src_img = load_image(frames_dir, cam_name)
+            if apply_wb_flag and cam_name != ref_name:
+                src_img = apply_wb_exposure(src_img, cam, cameras[ref_name],
+                                            ref_img=ref_img)
+            source_images_ff[cam_name] = src_img
 
-            # 1. Load source image
-            src_img = load_image(frames_dir, cam_name)  # uint16
+        for cam_name, cam in cameras.items():
+            if cam_name not in source_images_ff:
+                continue
+            src_img = source_images_ff[cam_name]
 
-            # 2. Apply CCM to GLUED mirror cameras only (exposure-neutral chromaticity fix)
-            if apply_ccm_flag and cam.get('mirror_type', 'NONE') not in ('NONE', 'MOVABLE'):
-                ccm = estimate_ccm_from_cameras(src_img, ref_img, cam, cameras[ref_name])
-                src_img = apply_ccm(src_img, ccm)
-
-            # 3. Resolve per-camera canvas-space depth.
-            # A cameras: use MVS depth directly when available (already in virtual
-            # camera frame — no forward-warp needed).  Fall back to per-camera
-            # Depth Pro NPZ (forward-warped) if MVS map is absent.
-            # B cameras: unchanged — per-camera Depth Pro NPZ or fixed 5.0m plane.
+            # Resolve per-camera canvas-space depth.
             if cam_name[:1] == 'A' and mvs_depth is not None:
                 cam_depth = mvs_depth
             else:
@@ -490,7 +603,6 @@ def assemble_canvas(
                     fixed_fallback_m=_b_fixed_depth,
                 )
 
-            # 4. Load or compute remap
             map_x, map_y, mask = None, None, None
             if remap_cache_dir:
                 cached = load_remap_cache(remap_cache_dir, cam_name)
@@ -502,10 +614,10 @@ def assemble_canvas(
                     os.makedirs(remap_cache_dir, exist_ok=True)
                     cache_remap(remap_cache_dir, cam_name, map_x, map_y, mask)
 
-            # 5. Compute confidence map
+            # Confidence map
             conf = compute_confidence(src_img, cam, virtual_cam, mask, map_x, map_y)
 
-            # 6. Warp source image to output canvas
+            # Warp source image to output canvas
             warped = apply_remap(src_img.astype(np.float32), map_x, map_y,
                                  interpolation=_pick_interp(cam, virtual_cam))
 
@@ -523,29 +635,16 @@ def assemble_canvas(
         # Preload all source images once (avoid 260 disk reads for 26 tiles × 10 cameras)
         print("  preloading source images...", flush=True)
         source_images = {}
-        _movable_warned: set = set()
         for cam_name, cam in cameras.items():
-            # Skip movable-mirror cameras in tele mode.
-            # In wide mode, include them with a per-camera warning.
-            if cam.get('mirror_type', 'NONE') == 'MOVABLE':
-                if vc_mode != 'wide':
-                    continue
-                if cam_name not in _movable_warned:
-                    import warnings
-                    warnings.warn(
-                        f"Camera {cam_name} has a MOVABLE mirror — factory R calibration "
-                        "may be stale. Alignment in wide mode may be imperfect.",
-                        stacklevel=2,
-                    )
-                    _movable_warned.add(cam_name)
             frame_path = os.path.join(frames_dir, f'{cam_name}.png')
             if not os.path.exists(frame_path):
                 continue
             src_img = load_image(frames_dir, cam_name)
-            # Apply CCM to GLUED mirror cameras (exposure-neutral chromaticity fix)
-            if apply_ccm_flag and cam.get('mirror_type', 'NONE') not in ('NONE', 'MOVABLE'):
-                ccm = estimate_ccm_from_cameras(src_img, ref_img, cam, cameras[ref_name])
-                src_img = apply_ccm(src_img, ccm)
+            # Apply per-channel WB + exposure normalization (replaces CCM).
+            # Skip for the reference camera itself.
+            if apply_wb_flag and cam_name != ref_name:
+                src_img = apply_wb_exposure(src_img, cam, cameras[ref_name],
+                                            ref_img=ref_img)
             source_images[cam_name] = src_img
         active_cams = list(source_images.keys())
         print(f"  loaded {len(source_images)} cameras: {active_cams}", flush=True)
@@ -590,23 +689,61 @@ def assemble_canvas(
         print(f"  depth: {n_with_depth}/{len(per_cam_depth)} cameras have per-camera depth",
               flush=True)
 
-        strips = []
+        # Build tile ranges and submit in parallel using threads.
+        # When MPS (Metal GPU) is active, the GPU executes each remap serially
+        # inside compute_remap — sending work from multiple threads just contends
+        # on the single MPS command queue and is slower than serial dispatch.
+        # Use n_workers=1 when MPS is available; multi-thread only for pure NumPy.
+        import concurrent.futures, os as _os
+        from lri_camera_remap import _MPS_AVAILABLE as _mps_flag
+        import lri_camera_remap as _remap_mod
+        if _remap_mod._MPS_AVAILABLE is None:
+            try:
+                import torch
+                _remap_mod._MPS_AVAILABLE = torch.backends.mps.is_available()
+            except ImportError:
+                _remap_mod._MPS_AVAILABLE = False
+        _using_mps = _remap_mod._MPS_AVAILABLE
+        if _using_mps:
+            n_workers = int(_os.environ.get('LRI_BLEND_WORKERS', '1'))
+        else:
+            n_workers = min(
+                int(_os.environ.get('LRI_BLEND_WORKERS', '0')) or _os.cpu_count() or 4,
+                10,  # cap at 10 — beyond this, memory bandwidth becomes the limit
+            )
+
+        tile_ranges = []
         row = 0
         while row < H_out:
-            row_end = min(row + tile_rows, H_out)
-            print(f"  tile rows {row}–{row_end} / {H_out}", flush=True)
-            strip = _assemble_tile(
-                row_start=row,
-                row_end=row_end,
+            tile_ranges.append((row, min(row + tile_rows, H_out)))
+            row += tile_rows
+
+        print(f"  assembling {len(tile_ranges)} tiles on {n_workers} threads", flush=True)
+        strips_by_start: dict = {}
+
+        def _run_tile(row_start_row_end):
+            rs, re = row_start_row_end
+            return rs, _assemble_tile(
+                row_start=rs,
+                row_end=re,
                 source_images=source_images,
                 cameras=cameras,
                 virtual_cam=virtual_cam,
                 per_cam_depth=per_cam_depth,
                 remap_cache_dir=remap_cache_dir,
             )
-            strips.append(strip)
-            row = row_end
 
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futs = {pool.submit(_run_tile, rng): rng for rng in tile_ranges}
+            done = 0
+            for fut in concurrent.futures.as_completed(futs):
+                rs, strip = fut.result()
+                strips_by_start[rs] = strip
+                done += 1
+                print(f"  [{done}/{len(tile_ranges)}] tile {rs}–{rs+strip.shape[0]} done",
+                      flush=True)
+
+        strips = [strips_by_start[rs] for rs, _ in tile_ranges]
         return np.concatenate(strips, axis=0)
 
 
@@ -684,7 +821,10 @@ if __name__ == '__main__':
     depth = load_depth_for_canvas(args.lumen, vc, ref_name, cameras[ref_name])
     if depth is None:
         print("  No depth found — using flat-plane fallback.")
-        depth = flat_plane_depth(vc)
+        # Pass None so compute_remap uses its internal _DEFAULT_DEPTH_MM constant
+        # rather than a pre-allocated flat array.  This avoids loading a
+        # 1.5 GB float32 flat-plane depth into every camera's use_depth=True path.
+        depth = None
 
     print(f"Assembling canvas {vc.W}×{vc.H} …")
     result = assemble_canvas(

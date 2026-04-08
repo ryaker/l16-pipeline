@@ -419,12 +419,11 @@ def run_patchmatch(
     print(f"[mvs] initial cost: mean={cost.mean():.4f}  median={cost.median():.4f}")
 
     # ── Stage 2: PatchMatch iterations ───────────────────────────────────────
-    # When initialized at focus distance, start delta at 10% of focus depth.
-    # This prevents far-field noise from randomly walking depth far from the prior.
-    if depth_init is not None:
-        depth_delta = depth_init * 0.1   # 10% of focus depth
-    else:
-        depth_delta = (depth_max - depth_min) * 0.5
+    # Always start delta at half the search range so every pixel can reach any
+    # depth in the range within the first iteration.  The focus_distance init
+    # only sets the *starting* depth — it is a lens calibration parameter, not
+    # a reliable per-scene depth prior, so we must not constrain exploration.
+    depth_delta = (depth_max - depth_min) * 0.5
 
     for it in range(n_iterations):
         t0 = time.time()
@@ -630,14 +629,20 @@ def depth_range_from_calibration(cal_path: str, cam_names: list[str]) -> tuple[f
                 focus_distances.append(float(fd))
 
     if focus_distances:
-        fd_m = float(np.median(focus_distances))
-        # focus_distance in calibration appears to be in metres (1500 = 1500m)
-        # Sanity check: values < 1 are likely in mm (e.g. 0.5 = 500mm = 0.5m)
-        if fd_m < 1.0:
-            fd_m = fd_m * 1000.0
-        print(f"[mvs] focus_distance from calibration: {fd_m:.1f} m")
-        d_min = max(0.5, fd_m * 0.5)
-        d_max = min(50000.0, fd_m * 10.0)
+        fd_raw = float(np.median(focus_distances))
+        # focus_distance in calibration is in mm (e.g. 1500 = 1500 mm = 1.5 m).
+        # Values > 200 are clearly mm (no L16 scene is focused at 200+ metres);
+        # values <= 0.2 are already in metres (sub-metre close-focus corner case).
+        if fd_raw > 200.0:
+            fd_m = fd_raw / 1000.0   # mm → m
+        elif fd_raw < 0.2:
+            fd_m = fd_raw * 1000.0   # was somehow stored as fractional metres → mm→m
+        else:
+            fd_m = fd_raw            # already reasonable metres (0.2–200 m)
+        print(f"[mvs] focus_distance from calibration: {fd_raw:.1f} raw → {fd_m:.3f} m")
+        # Depth range: cover the scene out to 50× focus distance (min 1 m, max 500 m).
+        d_min = max(0.3, fd_m * 0.2)
+        d_max = min(500.0, fd_m * 50.0)
         return d_min, d_max, fd_m
     else:
         print("[mvs] WARNING: no focus_distance in calibration, using fallback range 1–10000 m")
