@@ -46,13 +46,14 @@ class GroupVirtualCamera:
 
     Position: centroid of the group's translations.
     Orientation: identity (all L16 cameras point along +Z).
-    Intrinsics: median focal length of the group, FOV = union of group FOVs.
+    Intrinsics: focal length (median by default, configurable via fx_mode),
+                FOV = union of group FOVs.
 
     No camera in the group is singled out.  Order of cameras passed in is
     irrelevant; the output is permutation-invariant.
     """
 
-    def __init__(self, cameras: dict):
+    def __init__(self, cameras: dict, fx_mode: str | float = 'median'):
         """
         Parameters
         ----------
@@ -60,6 +61,15 @@ class GroupVirtualCamera:
             Subset of cameras to merge.  Each entry must have keys
             K, R, t, W, H.  All cameras in the group should share the
             same focal length (within a few percent).
+        fx_mode : str or float, optional
+            Method for selecting the canvas focal length:
+            - 'median' (default): use median focal length across all cameras.
+              Good for same-focal-length groups.
+            - 'max': use the highest focal length in the group. Best for
+              mixed-focal-length merges (e.g., 5 wide + 5 tele cameras):
+              canvas is at tele resolution, wide content upsampled once.
+            - 'min': use the lowest focal length in the group.
+            - float: explicit focal length value (in pixels).
         """
         if not cameras:
             raise ValueError("cameras dict is empty")
@@ -71,11 +81,25 @@ class GroupVirtualCamera:
         # Identity rotation (L16 cameras all point +Z)
         self.R = np.eye(3, dtype=np.float64)
 
-        # Median focal length
+        # Focal length selection based on fx_mode
         fxs = [float(c['K'][0, 0]) for c in cameras.values()]
         fys = [float(c['K'][1, 1]) for c in cameras.values()]
-        output_fx = float(np.median(fxs))
-        output_fy = float(np.median(fys))
+        
+        if isinstance(fx_mode, (int, float)):
+            output_fx = float(fx_mode)
+            output_fy = float(fx_mode)
+        elif fx_mode == 'median':
+            output_fx = float(np.median(fxs))
+            output_fy = float(np.median(fys))
+        elif fx_mode == 'max':
+            output_fx = float(np.max(fxs))
+            output_fy = float(np.max(fys))
+        elif fx_mode == 'min':
+            output_fx = float(np.min(fxs))
+            output_fy = float(np.min(fys))
+        else:
+            raise ValueError(f"fx_mode='{fx_mode}' not recognized; "
+                           "use 'median', 'max', 'min', or a numeric value")
 
         # FOV = union across all participating cameras
         half_fov_h_list = []
@@ -204,7 +228,10 @@ def merge_cameras(
         Provides per-camera factory vignetting + scene AWB.
     virtual_cam : GroupVirtualCamera, optional
         Output canvas.  If None, one is built from the group's centroid and
-        median focal length.
+        median focal length.  For best quality with mixed-focal-length groups
+        (e.g., 5 wide + 5 tele cameras), pass
+        ``virtual_cam=GroupVirtualCamera(cameras, fx_mode='max')`` to canvas
+        at the tele (highest-fx) resolution and upsample wide content once.
     depth : float or np.ndarray
         Scene depth in metres.  Either a flat plane (single float) or a
         per-pixel depth map (H_out, W_out) in the virtual camera's frame.
