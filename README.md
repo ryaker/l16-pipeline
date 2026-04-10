@@ -37,6 +37,76 @@ Key findings so far:
 
 ---
 
+## Camera Hardware Reference
+
+### 3D positions (all cameras, A1 = world origin, mm)
+
+Positions derived from factory calibration data in the LRI. The real sensor
+lens centre is the reference point for A cameras; for B/C periscope cameras
+the entrance pupil is what matters for multi-view stereo (the physical sensor
+is mounted sideways behind the fold mirror).
+
+| Camera | Group | Type | x mm | y mm | z mm | Baseline to A1 |
+|--------|-------|------|-----:|-----:|-----:|---------------:|
+| A1 | 28 mm | Direct-fire | 0.0 | 0.0 | 0.0 | — |
+| A2 | 28 mm | Direct-fire | −27.7 | −23.4 | 0.0 | 36 mm |
+| A3 | 28 mm | Direct-fire | +8.5 | −23.6 | 0.0 | 25 mm |
+| A4 | 28 mm | Direct-fire | +24.4 | +23.5 | 0.0 | 34 mm |
+| A5 | 28 mm | Direct-fire | −43.3 | +1.2 | 0.0 | 43 mm |
+| B1 | 70 mm | MOVABLE mirror | +18.6 | +7.4 | −5.2 | 20 mm |
+| B2 | 70 mm | MOVABLE mirror | −8.7 | −18.7 | −5.0 | 21 mm |
+| B3 | 70 mm | MOVABLE mirror | +8.5 | +34.0 | −6.2 | 35 mm |
+| B4 | 70 mm | GLUED mirror (center) | −7.5 | +12.7 | −10.6 | 15 mm |
+| B5 | 70 mm | MOVABLE mirror | −33.6 | +33.6 | −6.0 | 48 mm |
+| C1 | 150 mm | MOVABLE mirror | −18.1 | +24.9 | −8.4 | 31 mm |
+| C2 | 150 mm | MOVABLE mirror | −35.3 | −10.2 | −9.2 | 37 mm |
+| C3 | 150 mm | MOVABLE mirror | +26.7 | −18.0 | −7.0 | 32 mm |
+| C4 | 150 mm | MOVABLE mirror | +43.5 | +8.9 | −4.0 | 44 mm |
+| C5 | 150 mm | GLUED mirror | +37.1 | −5.6 | −12.5 | 37 mm |
+| C6 | 150 mm | GLUED mirror | +35.0 | +34.8 | −12.6 | 49 mm |
+
+**28mm-mode stereo baselines (A cameras only):** min 25 mm (A1↔A3), max 43 mm (A1↔A5). Average ~34 mm. At 38 m focus distance this gives ~sub-pixel disparity at far field; at 1–5 m depth parallax is a useful 0.5–2 mm. Widest baseline in the whole array: B5↔A5 ≈ 48 mm.
+
+Full table with front-face pixel positions and confidence scores: [`L16_camera_positions.json`](L16_camera_positions.json)
+
+---
+
+### ISP pipeline — implementation status
+
+| Stage | Status | Data source | Notes |
+|-------|--------|-------------|-------|
+| Black level subtraction | ❌ Not implemented | **Unknown** — not in LRI | Estimated 64–128 raw counts; raw frames appear pre-subtracted in our extractor |
+| Vignetting correction | ✅ Done | LRI photometric.f2 (17×13 float32 grid) | `apply_vignetting_correction()` |
+| Cross-talk correction | ❌ Not implemented | Unknown | Referenced in Lumen pipeline order; data source not found |
+| CRA correction | ✅ Done | LRI photometric.f1 (17×13 × 4×4 Bayer mixing) | `apply_cra_correction()` — converts to 3×3 RGB, bilinearly interpolated |
+| AWB gains | ✅ Done | LRI ViewPreferences.ChannelGain (field 19.f15) | Same gains applied identically to every camera |
+| Demosaic | ✅ Done (OpenCV) | — | Lumen uses Halide-compiled kernel; our variant is standard Bilinear/VNG |
+| CCM (Color Correction Matrix) | ✅ Done | LRI ColorCalibration (field 13.f2) | `apply_ccm_correction()` + `select_ccm()` |
+| Denoising | ❌ Not implemented | — | Lumen uses Halide kernel; algorithm unknown |
+| Multi-view warp (K/R/t) | ✅ Done | LRI GeometricCalibration | `lri_camera_remap.py` |
+| MOVABLE mirror pose | ✅ Fixed | LRI MirrorSystem + MirrorActuatorMapping | V1 Rodrigues formula: `rodrigues((0,0,1), axis, angle_deg)` |
+| Flat-plane depth merge | ✅ Done | — | `lri_merge_flow.py` with DIS optical flow refinement |
+| Per-capture bundle adjust | ❌ Not implemented | Lumen computes via Ceres at render time | Empirically: ~1.9 px mean correction; DIS flow covers ~70% of this |
+| Multi-view stereo depth | ❌ Not implemented | — | Needed for B/C camera overlay on A canvas |
+| Highlight restoration | ❌ Not implemented | — | Algorithm unknown |
+| Tone mapping | Partial | — | sRGB gamma + auto-expose; no local tone map |
+
+---
+
+### CCM illuminant modes
+
+Light stores 3 color correction matrices per camera at fixed illuminants.
+
+| Mode | Illuminant | Color Temp | AWBMode enum value | Notes |
+|------|------------|-----------|-------------------|-------|
+| 0 | Illuminant A (Tungsten) | 2856 K | `TUNGSTEN=4` | Warm incandescent |
+| 2 | D65 (Standard Daylight) | 6504 K | `DAYLIGHT=1`, `AUTO=0` | Default for outdoor/auto |
+| 6 | F11 / D50 (Fluorescent) | ~5000 K | `FLUORESCENT=5` | Cool fluorescent |
+
+Interpolation for AUTO mode: estimate CCT from AWB R/B gain ratio, blend between the 3 matrices. `select_ccm(awb_mode, ccm_list)` in `lri_calibration.py` currently maps AUTO → D65 (good default for outdoor daylight captures).
+
+---
+
 ## Working On Now
 
 ### v2 Synthetic Canvas Fusion (new)
