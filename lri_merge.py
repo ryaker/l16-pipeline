@@ -29,7 +29,8 @@ import os
 import numpy as np
 import cv2
 
-from lri_calibration import apply_vignetting_correction, apply_cra_correction
+from lri_calibration import (apply_vignetting_correction, apply_cra_correction,
+                              apply_ccm_correction, select_ccm)
 from lri_camera_remap import compute_remap, apply_remap
 from lri_confidence import compute_confidence
 
@@ -125,6 +126,7 @@ def _apply_factory_isp(
     module_cal: dict | None,       # sensor_cal['modules'][cam_name] or None
     awb: dict | None,              # sensor_cal['awb'] or None
     target_effective_exposure: float,
+    awb_mode: int | None = None,   # sensor_cal['awb_mode'] — selects CCM
 ) -> np.ndarray:
     """
     Apply the factory ISP stages to a single raw frame.
@@ -133,6 +135,7 @@ def _apply_factory_isp(
       1. Factory vignetting (17x13 flat-field grid)
       2. Factory CRA correction (17x13 grid of 4x4 Bayer channel mixing matrices)
       3. Factory AWB (per-channel gains, same for all cameras)
+      3b. CCM (3x3 Color Correction Matrix — converts camera linear → sRGB linear)
       4. Absolute EV normalization
 
     Returns float32 BGR (H, W, 3) in the uint16 intensity scale [0, 65535].
@@ -155,6 +158,12 @@ def _apply_factory_isp(
             awb['R'],
         ], dtype=np.float32)
         img = img * awb_bgr[None, None, :]
+
+    # 3b. CCM — converts camera linear RGB to sRGB-linear color space
+    if module_cal is not None and module_cal.get('ccm'):
+        ccm = select_ccm(awb_mode, module_cal['ccm'])
+        if ccm is not None:
+            img = apply_ccm_correction(img, ccm)
 
     # 4. Absolute EV normalization
     # target_effective_exposure is analog_gain * exposure_ns for the reference
@@ -264,8 +273,10 @@ def merge_cameras(
 
         module_cal = sensor_cal.get('modules', {}).get(cam_name) if sensor_cal else None
         awb = sensor_cal.get('awb') if sensor_cal else None
+        awb_mode = sensor_cal.get('awb_mode') if sensor_cal else None
 
-        img = _apply_factory_isp(raw, cam, module_cal, awb, target_effective_exposure)
+        img = _apply_factory_isp(raw, cam, module_cal, awb, target_effective_exposure,
+                                  awb_mode=awb_mode)
 
         map_x, map_y, mask = compute_remap(virtual_cam, cam, depth_map)
         warped = apply_remap(img, map_x, map_y, interpolation=cv2.INTER_LINEAR)

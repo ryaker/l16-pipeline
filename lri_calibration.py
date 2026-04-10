@@ -788,16 +788,23 @@ def extract_sensor_calibration(path: str) -> Dict:
     for hdr in all_header_msgs:
         # ── AWB from ViewPreferences (field 19) ─────────────────────────────
         vp_msgs = hdr.get_message_array(19)
-        if vp_msgs and result['awb'] is None:
+        if vp_msgs:
             vp = vp_msgs[0]
-            gain_msg = vp.get_message(15)   # ChannelGain: f1=R f2=Gr f3=Gb f4=B
-            if gain_msg:
-                result['awb'] = {
-                    'R':  gain_msg.get_float(1),
-                    'Gr': gain_msg.get_float(2),
-                    'Gb': gain_msg.get_float(3),
-                    'B':  gain_msg.get_float(4),
-                }
+            # Extract AWB gains (field 15)
+            if result['awb'] is None:
+                gain_msg = vp.get_message(15)   # ChannelGain: f1=R f2=Gr f3=Gb f4=B
+                if gain_msg:
+                    result['awb'] = {
+                        'R':  gain_msg.get_float(1),
+                        'Gr': gain_msg.get_float(2),
+                        'Gb': gain_msg.get_float(3),
+                        'B':  gain_msg.get_float(4),
+                    }
+            # Extract AWB mode (field 7)
+            if 'awb_mode' not in result:
+                awb_mode_val = vp.get_uint64(7)
+                if awb_mode_val is not None:
+                    result['awb_mode'] = int(awb_mode_val)
 
         # ── Vignetting from FactoryModuleCalibration field 4 ────────────────
         for cal_msg in hdr.get_message_array(13):
@@ -987,8 +994,86 @@ def apply_cra_correction(
             coeff = M3_rgb[:, :, out_rgb, in_rgb]   # (GH, GW) one coefficient plane
             coeff_full = cv2.resize(coeff, (W, H), interpolation=cv2.INTER_LINEAR)
             out[:, :, out_bgr] += coeff_full * img[:, :, in_bgr]
-
     return out
+
+
+def apply_ccm_correction(img, ccm_3x3):
+    """
+    Apply a 3×3 Color Correction Matrix to a debayered BGR image.
+    
+    CCM converts from camera linear RGB to a standard linear color space.
+    Applied after AWB, before tone mapping. Matrix is in RGB order;
+    image is in BGR (OpenCV) order — the function handles the swap.
+    
+    Parameters
+    ----------
+    img : np.ndarray
+        float32 (H, W, 3) BGR image in linear light.
+    ccm_3x3 : np.ndarray
+        3×3 float32 CCM in RGB row order. Row i = output channel i (R/G/B),
+        column j = input channel j (R/G/B).
+    
+    Returns
+    -------
+    np.ndarray
+        float32 (H, W, 3) BGR CCM-corrected image.
+    """
+    import numpy as np
+    # Convert BGR → RGB, apply CCM, convert back to BGR
+    rgb = img[..., ::-1]  # BGR→RGB view
+    corrected_rgb = rgb @ ccm_3x3.T  # row-wise matmul: each pixel RGB * CCM^T
+    return corrected_rgb[..., ::-1].astype(np.float32)  # RGB→BGR
+
+
+def select_ccm(awb_mode, ccm_list, awb_gains=None):
+    """
+    Select the appropriate CCM from the per-camera list based on AWB mode.
+    
+    Parameters
+    ----------
+    awb_mode : int or None
+        ViewPreferences awb_mode enum value (0=AUTO, 1=DAYLIGHT, 4=TUNGSTEN, 5=FLUORESCENT, etc.)
+    ccm_list : list of dict
+        Per-camera CCM list from extract_sensor_calibration(), each dict has
+        {'mode': int, 'forward': np.ndarray (3,3), 'inverse': np.ndarray (3,3)}.
+        Modes present: 0 (Tungsten), 2 (D65), 6 (F11/D50).
+    awb_gains : dict or None
+        AWB gains {'R', 'Gr', 'Gb', 'B'} for AUTO-mode interpolation.
+    
+    Returns
+    -------
+    np.ndarray
+        3×3 float32 forward CCM, or None if ccm_list is empty.
+    """
+    if not ccm_list:
+        return None
+    
+    # Build mode → matrix lookup
+    mode_map = {c['mode']: c['forward'] for c in ccm_list if c.get('forward') is not None}
+    if not mode_map:
+        return None
+    
+    # Map awb_mode to preferred CCM mode
+    # Mode numbers: 0=Tungsten(A), 2=D65, 6=F11/D50
+    awb_to_ccm = {
+        0: 2,   # AUTO → D65 (default outdoor)
+        1: 2,   # DAYLIGHT → D65
+        2: 2,   # SHADE → D65 (slightly cooler, D65 close enough)
+        3: 2,   # CLOUDY → D65
+        4: 0,   # TUNGSTEN → Illuminant A
+        5: 6,   # FLUORESCENT → F11/D50
+        6: 2,   # FLASH → D65 (flash is daylight-balanced)
+        7: 2,   # CUSTOM → D65 as default
+        8: 2,   # KELVIN → D65 as default; TODO: could interpolate by CCT
+    }
+    
+    preferred_mode = awb_to_ccm.get(awb_mode if awb_mode is not None else 0, 2)
+    
+    # Return preferred or fall back to closest available
+    if preferred_mode in mode_map:
+        return mode_map[preferred_mode]
+    # Fall back to mode 2 (D65), then any available mode
+    return mode_map.get(2) or mode_map.get(0) or next(iter(mode_map.values()))
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
