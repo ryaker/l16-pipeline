@@ -319,48 +319,34 @@ def compute_movable_mirror_pose(
     """
     Derive virtual camera extrinsics (R, t) for a movable-mirror module.
 
-    The physical camera sits behind a flat mirror.  Rotating the mirror
-    by the given angle changes the effective viewing direction.
+    The periscope camera's physical sensor faces inward toward a flat mirror;
+    the mirror redirects the optical path toward the scene.  The virtual
+    camera (what we pretend is looking directly at the scene) has:
+      - Position  = reflection of the real sensor position across the mirror plane
+      - Viewing direction = (0,0,1) rotated around the actuator axis by the
+                             mirror angle.  Empirically verified on L16_04574:
+                             this produces ~37° off-axis for B1/B2/B3/B5 matching
+                             the 28mm A-camera FOV corners.  (The proto's
+                             `mirror_normal_at_zero_degrees` field is NOT the
+                             physical mirror normal in a way that directly gives
+                             the virtual camera forward — −n comes out at ~53°.)
 
-    Mathematics
-    -----------
-    Given mirror normal n (unit vector at the actual angle):
-      H = I − 2 n nᵀ                   (Householder reflection, det = −1)
-
-    Virtual camera centre (world coords):
-      d      = n · (C_real − P_mirror)   (signed distance real cam → mirror plane)
-      C_virt = C_real − 2 d n
-
-    Virtual rotation (world → cam), keeping det = +1:
-      R_virt = R_colmap · H · diag(−1, 1, 1)   → det = +1
-    where R_colmap = R_proto.T  (proto stores cam→world; COLMAP uses world→cam)
-
-    Virtual translation (COLMAP convention X_cam = R t + t_col):
-      t_virt = −R_virt · C_virt
-
-    The diag(−1,1,1) factor negates the x-axis of the virtual image,
-    equivalent to a left–right flip; downstream code should set cx′ = W − cx
-    if pixel-accurate epipolar lines are needed.  For depth estimation the
-    camera centres and optical axes are correct regardless.
+    We construct R_virt via look-at: forward is the rotated sensor axis,
+    up is world +y (A-camera convention), right = up × forward.
+    R_virt rows = [right, up, forward] — world→cam, det = +1.
 
     Returns (R_virt 3×3, t_virt 3-vector) or (None, None) if data is missing.
     """
     loc_msg  = ms_msg.get_message(1)   # real_camera_location  (Point3F)
-    ori_msg  = ms_msg.get_message(2)   # real_camera_orientation (Matrix3x3F)
     axis_msg = ms_msg.get_message(3)   # rotation_axis          (Point3F)
     pont_msg = ms_msg.get_message(4)   # point_on_rotation_axis (Point3F)
     dist     = ms_msg.get_float(5)     # dist mirror-plane → axis point (mm)
     norm_msg = ms_msg.get_message(6)   # mirror_normal_at_zero_degrees (Point3F)
 
-    if not all([loc_msg, ori_msg, axis_msg, pont_msg, norm_msg]):
+    if not all([loc_msg, axis_msg, pont_msg, norm_msg]):
         return None, None
 
     C_real = parse_point3f(loc_msg)        # real camera centre in world (mm)
-    # The MirrorSystem proto stores real_camera_orientation as a cam→world rotation
-    # (column vectors = world basis axes expressed in camera frame), i.e. the
-    # transpose of the COLMAP convention (world→cam).  Transpose to get R_colmap.
-    R_cam_to_world = parse_matrix3x3(ori_msg)
-    R_real = [[R_cam_to_world[j][i] for j in range(3)] for i in range(3)]  # world→cam
     axis   = parse_point3f(axis_msg)       # rotation axis (unit vector)
     pont   = parse_point3f(pont_msg)       # point on rotation axis
     n0     = parse_point3f(norm_msg)       # mirror normal at 0 °
@@ -370,7 +356,7 @@ def compute_movable_mirror_pose(
     if ax_len < 1e-9: return None, None
     axis = [v/ax_len for v in axis]
 
-    # Mirror normal at actual angle
+    # Mirror normal at actual angle (rotate n0 around the actuator axis)
     angle_deg = hall_code_to_mirror_angle(mam_msg, mirror_hall_code)
     n = _rodrigues(n0, axis, angle_deg)
     n_len = math.sqrt(_dot3(n, n))
@@ -380,24 +366,45 @@ def compute_movable_mirror_pose(
     # Mirror plane anchor point:  P = pont − dist * n
     P = [pont[i] - dist * n[i] for i in range(3)]
 
-    # Reflect real camera centre across mirror plane
+    # Virtual camera centre = reflect real centre across mirror plane
     d      = _dot3(n, [C_real[i] - P[i] for i in range(3)])
     C_virt = [C_real[i] - 2*d*n[i] for i in range(3)]
 
-    # H = Householder (det = −1)
-    H = _householder(n)
+    # ── Build R_virt via look-at from rotated sensor axis ─────────────────
+    # Virtual forward = (0,0,1) rotated around the actuator axis by angle_deg.
+    # Empirical: this gives ~37° off-axis for L16_04574 B1/B2/B3/B5, matching
+    # the four A-FOV corners.  Using −n here gives ~53°, wrong by the
+    # complement (cos→sin swap).
+    fwd = _rodrigues([0.0, 0.0, 1.0], axis, angle_deg)
+    fl = math.sqrt(_dot3(fwd, fwd))
+    if fl < 1e-9: return None, None
+    fwd = [v/fl for v in fwd]
 
-    # R_real · H  (det = −1)
-    R_H = _mat3_mul(R_real, H)
+    # World up convention (matches A-camera identity R in the L16 calibration)
+    up = [0.0, 1.0, 0.0]
+    # Guard: if forward and up are nearly parallel, use an alternate up axis
+    if abs(_dot3(up, fwd)) > 0.999:
+        up = [0.0, 0.0, 1.0] if abs(fwd[1]) < 0.9 else [1.0, 0.0, 0.0]
 
-    # Apply diag(−1,1,1) on the right to restore det = +1  (flips image x-axis)
-    # NOTE: this left-right flip means the virtual sensor image has its x-axis
-    # mirrored vs the physical sensor.  Downstream code using K directly must set
-    # cx_eff = W − cx when projecting from virtual-camera to sensor coordinates.
-    flip = [[-1,0,0],[0,1,0],[0,0,1]]
-    R_virt = _mat3_mul(R_H, flip)
+    # right = up × forward
+    right = [up[1]*fwd[2] - up[2]*fwd[1],
+             up[2]*fwd[0] - up[0]*fwd[2],
+             up[0]*fwd[1] - up[1]*fwd[0]]
+    rl = math.sqrt(_dot3(right, right))
+    if rl < 1e-9: return None, None
+    right = [v/rl for v in right]
 
-    # COLMAP translation:  t = −R · C
+    # up' = forward × right (make orthogonal)
+    new_up = [fwd[1]*right[2] - fwd[2]*right[1],
+              fwd[2]*right[0] - fwd[0]*right[2],
+              fwd[0]*right[1] - fwd[1]*right[0]]
+    ul = math.sqrt(_dot3(new_up, new_up))
+    new_up = [v/ul for v in new_up]
+
+    # R_virt rows = [right, up, forward]  (world→cam, det = +1, trace in [-1, 3])
+    R_virt = [right, new_up, fwd]
+
+    # COLMAP translation:  t = −R · C_virt
     t_virt = [-sum(R_virt[i][j]*C_virt[j] for j in range(3)) for i in range(3)]
 
     return R_virt, t_virt
@@ -734,6 +741,254 @@ def write_frame_info(result: Dict, outdir: str):
     with open(path, 'w') as f:
         f.write('\n'.join(lines) + '\n')
     return path
+
+
+# ── Sensor calibration: vignetting + CCM + AWB ──────────────────────────────
+
+def extract_sensor_calibration(path: str) -> Dict:
+    """
+    Extract per-module sensor calibration from an LRI file.
+
+    Returns a dict with:
+      'awb': {'R': float, 'Gr': float, 'Gb': float, 'B': float}
+      'modules': {
+          'A1': {
+              'vignetting': np.ndarray (H_grid, W_grid) float32 gain multipliers,
+              'ccm': [{'mode': int, 'forward': 3x3, 'inverse': 3x3}, ...],
+          }, ...
+      }
+
+    The vignetting grid is a 17×13 flat-field correction: multiply raw pixel
+    values by the bilinear-interpolated grid to remove lens/sensor vignetting.
+    Grid values are normalised so the brightest point = 1.0 and corners > 1.
+
+    CCMs are 3×3 color correction matrices at different illuminant modes.
+    """
+    import numpy as np
+
+    with open(path, 'rb') as f:
+        data = f.read()
+
+    all_header_msgs: List[ProtoReader] = []
+    offset = 0
+    while offset + HEADER_SIZE <= len(data):
+        sig = data[offset:offset+4]
+        if sig != LELR_MAGIC:
+            break
+        block_len, msg_offset, msg_len, msg_type = struct.unpack_from(
+            '<QQIB', data, offset + 4)
+        if msg_type == MSG_TYPE_LIGHT:
+            abs_msg_start = offset + msg_offset
+            all_header_msgs.append(
+                ProtoReader(data, abs_msg_start, msg_len).parse())
+        offset += block_len
+
+    result: Dict[str, Any] = {'awb': None, 'modules': {}}
+
+    for hdr in all_header_msgs:
+        # ── AWB from ViewPreferences (field 19) ─────────────────────────────
+        vp_msgs = hdr.get_message_array(19)
+        if vp_msgs and result['awb'] is None:
+            vp = vp_msgs[0]
+            gain_msg = vp.get_message(15)   # ChannelGain: f1=R f2=Gr f3=Gb f4=B
+            if gain_msg:
+                result['awb'] = {
+                    'R':  gain_msg.get_float(1),
+                    'Gr': gain_msg.get_float(2),
+                    'Gb': gain_msg.get_float(3),
+                    'B':  gain_msg.get_float(4),
+                }
+
+        # ── Vignetting from FactoryModuleCalibration field 4 ────────────────
+        for cal_msg in hdr.get_message_array(13):
+            cam_id = cal_msg.get_uint64(1)
+            cam_name = CAMERA_ID_NAMES.get(cam_id, f'cam{cam_id}')
+            if cam_name not in result['modules']:
+                result['modules'][cam_name] = {'vignetting': None, 'ccm': [], 'cra': None}
+
+            f4_msgs = cal_msg.get_message_array(4)
+            if f4_msgs:
+                f4 = f4_msgs[0]
+                f2_msgs = f4.get_message_array(2)
+                if f2_msgs:
+                    f2 = f2_msgs[0]
+                    sub = f2.get_message_array(2)
+                    if sub:
+                        s = sub[0]
+                        gw = s.get_uint64(1)
+                        gh = s.get_uint64(2)
+                        blob = s.fields.get(3, [b''])[0]
+                        if isinstance(blob, bytes) and len(blob) >= gw * gh * 4:
+                            vig = np.frombuffer(blob, dtype=np.float32)[:gw * gh]
+                            result['modules'][cam_name]['vignetting'] = \
+                                vig.reshape(int(gh), int(gw)).copy()
+
+            # ── CRA grid from photometric field 1 ────────────────────────────
+            # Structure: photometric.f1 → {sf1=width(17), sf2=height(13), sf4=blob}
+            # blob = width × height × 16 float32 values = 17×13 matrices of 4×4
+            # The 4×4 matrix is a per-cell Bayer channel mixing correction:
+            #   channels = (R=0, Gr=1, Gb=2, B=3)
+            #   output_RGGB = M @ input_RGGB  (corrects cross-channel leakage from CRA)
+            if f4_msgs:
+                f4 = f4_msgs[0]
+                f1_raw_list = f4.fields.get(1, [])
+                if f1_raw_list:
+                    f1_raw = f1_raw_list[0]
+                    if isinstance(f1_raw, (bytes, bytearray)):
+                        try:
+                            cra_sub = ProtoReader(f1_raw, 0, len(f1_raw)).parse()
+                            cw = int(cra_sub.fields.get(1, [17])[0])
+                            ch = int(cra_sub.fields.get(2, [13])[0])
+                            cra_blob = cra_sub.fields.get(4, [b''])[0]
+                            if (isinstance(cra_blob, (bytes, bytearray))
+                                    and len(cra_blob) == cw * ch * 16 * 4):
+                                cra_4x4 = np.frombuffer(cra_blob, dtype=np.float32)
+                                result['modules'][cam_name]['cra'] = \
+                                    cra_4x4.reshape(ch, cw, 4, 4).copy()
+                        except Exception:
+                            pass
+
+            # ── CCM from ColorCalibration (field 2 inside field 13) ─────────
+            f2_color = cal_msg.get_message_array(2)
+            if f2_color:
+                for cc in f2_color:
+                    mode = cc.get_uint64(1)
+                    fwd_msgs = cc.get_message_array(2)
+                    inv_msgs = cc.get_message_array(3)
+                    fwd = None
+                    inv = None
+                    if fwd_msgs:
+                        m = fwd_msgs[0]
+                        fwd = np.array([
+                            m.fields.get(j, [0.0])[0] for j in range(1, 10)
+                        ], dtype=np.float32).reshape(3, 3)
+                    if inv_msgs:
+                        m = inv_msgs[0]
+                        inv = np.array([
+                            m.fields.get(j, [0.0])[0] for j in range(1, 10)
+                        ], dtype=np.float32).reshape(3, 3)
+                    if fwd is not None:
+                        result['modules'][cam_name]['ccm'].append({
+                            'mode': int(mode),
+                            'forward': fwd,
+                            'inverse': inv,
+                        })
+
+    return result
+
+
+def apply_vignetting_correction(
+    img: 'np.ndarray',
+    vig_grid: 'np.ndarray',
+) -> 'np.ndarray':
+    """
+    Apply factory vignetting (flat-field) correction to a raw image.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        Raw debayered image, uint16 or float32 (H, W, 3).
+    vig_grid : np.ndarray
+        Factory vignetting grid (H_grid, W_grid) float32.
+        Values are gain multipliers: multiply by these to flatten response.
+
+    Returns
+    -------
+    np.ndarray
+        float32 (H, W, 3) corrected image.
+    """
+    import numpy as np
+    import cv2
+
+    H, W = img.shape[:2]
+    # Bilinear interpolate the small grid (e.g. 13×17) to full image size
+    vig_full = cv2.resize(vig_grid, (W, H), interpolation=cv2.INTER_LINEAR)
+    img_f = img.astype(np.float32)
+    # Apply as per-pixel gain (same correction for all 3 channels)
+    corrected = img_f * vig_full[:, :, None]
+    return corrected
+
+
+def apply_cra_correction(
+    img: 'np.ndarray',
+    cra_grid: 'np.ndarray',
+) -> 'np.ndarray':
+    """
+    Apply factory CRA (Chief Ray Angle) correction to a debayered BGR image.
+
+    The CRA grid corrects for cross-channel color leakage caused by off-axis
+    light rays hitting the Bayer sensor at an angle.  The factory stores a
+    17×13 grid of 4×4 mixing matrices in (R, Gr, Gb, B) channel order.  We
+    convert each cell to a 3×3 RGB matrix by averaging the two green rows/cols,
+    then bilinearly interpolate the grid to full image resolution and apply it
+    as a spatially-varying local color-correction.
+
+    Correction is negligible at the image center (~0.3% maximum deviation) and
+    grows to ~5% at the corners — exactly the expected CRA roll-off profile.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        Debayered BGR image, float32 (H, W, 3).  Vignetting should already
+        be applied before calling this.
+    cra_grid : np.ndarray
+        Factory CRA grid (H_grid=13, W_grid=17, 4, 4) float32, from
+        extract_sensor_calibration()['modules'][cam_name]['cra'].
+
+    Returns
+    -------
+    np.ndarray
+        float32 (H, W, 3) CRA-corrected BGR image.
+    """
+    import numpy as np
+    import cv2
+
+    H, W = img.shape[:2]
+    GH, GW = cra_grid.shape[:2]  # 13, 17
+
+    # Convert 4×4 (R, Gr, Gb, B) matrix to 3×3 (R, G, B).
+    # Post-demosaic G ≈ (Gr + Gb) / 2, so Gr ≈ Gb ≈ G.
+    # Derivation (output = M4 @ [R, Gr, Gb, B]^T, substituting Gr=Gb=G):
+    #
+    #   R_out  = M[0,0]*R + (M[0,1]+M[0,2])*G + M[0,3]*B
+    #   G_out  = ((M[1,0]+M[2,0])/2)*R + ((M[1,1]+M[1,2]+M[2,1]+M[2,2])/2)*G
+    #                                   + ((M[1,3]+M[2,3])/2)*B
+    #   B_out  = M[3,0]*R + (M[3,1]+M[3,2])*G + M[3,3]*B
+    #
+    # Key: R/B input G-column = SUM of Gr+Gb cols (not average);
+    #      G output row        = AVERAGE of Gr+Gb rows.
+    M4 = cra_grid  # (GH, GW, 4, 4)
+    M3_rgb = np.empty((*M4.shape[:2], 3, 3), dtype=np.float32)
+
+    # R output row
+    M3_rgb[..., 0, 0] = M4[..., 0, 0]
+    M3_rgb[..., 0, 1] = M4[..., 0, 1] + M4[..., 0, 2]          # sum Gr+Gb cols
+    M3_rgb[..., 0, 2] = M4[..., 0, 3]
+
+    # G output row (average of Gr row and Gb row)
+    M3_rgb[..., 1, 0] = (M4[..., 1, 0] + M4[..., 2, 0]) * 0.5
+    M3_rgb[..., 1, 1] = (M4[..., 1, 1] + M4[..., 1, 2]
+                        + M4[..., 2, 1] + M4[..., 2, 2]) * 0.5
+    M3_rgb[..., 1, 2] = (M4[..., 1, 3] + M4[..., 2, 3]) * 0.5
+
+    # B output row
+    M3_rgb[..., 2, 0] = M4[..., 3, 0]
+    M3_rgb[..., 2, 1] = M4[..., 3, 1] + M4[..., 3, 2]          # sum Gr+Gb cols
+    M3_rgb[..., 2, 2] = M4[..., 3, 3]
+
+    # Upsample each of the 9 coefficient planes to full image size and apply.
+    # Input/output channel order: img is BGR so:
+    #   img channel 0 = B → RGB index 2
+    #   img channel 1 = G → RGB index 1
+    #   img channel 2 = R → RGB index 0
+    out = np.zeros_like(img)
+    for out_bgr, out_rgb in enumerate([2, 1, 0]):  # out channel BGR order
+        for in_bgr, in_rgb in enumerate([2, 1, 0]):  # in  channel BGR order
+            coeff = M3_rgb[:, :, out_rgb, in_rgb]   # (GH, GW) one coefficient plane
+            coeff_full = cv2.resize(coeff, (W, H), interpolation=cv2.INTER_LINEAR)
+            out[:, :, out_bgr] += coeff_full * img[:, :, in_bgr]
+
+    return out
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
