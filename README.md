@@ -1,8 +1,39 @@
 # l16-pipeline
 
-Modern ML/CV processing pipeline for the [Light L16](https://light.co/camera) computational camera — rebuilding the original Lumen software with Apple Depth Pro, a PySide6 desktop UI, and multi-camera depth fusion.
+Modern processing pipeline for the [Light L16](https://light.co/camera) computational camera. The ultimate goal is a **complete, open-source Lumen replacement** that any L16 owner can use to process captures on modern hardware, so the 10,000+ units Light sold before going out of business remain useful cameras for new photography.
 
-The Light L16 captured 10 simultaneous RAW frames (5 wide + 5 tele) and used computational photography to produce a single high-resolution image with synthetic depth-of-field. This project reverse-engineers the LRI file format and replaces the 2016 CIAPI pipeline with modern tools.
+The Light L16 has **16 camera modules** — 5× 28mm equivalent wide-angle (A1–A5, direct-fire), 5× 70mm telephoto (B1–B5, periscope + movable mirror), and 6× 150mm telephoto (C1–C6, periscope + movable mirror). At 28mm zoom it fires 5A+5B = 10 cameras simultaneously; at 70mm it fires 5B+6C = 11 cameras; at 150mm only the 6 C cameras fire. The original Lumen desktop software used the 10–11 captured frames to produce a fused 52-megapixel image with computational depth-of-field. When Light went out of business in 2018, Lumen stopped receiving updates and support.
+
+There are two complementary efforts in this repo:
+
+1. **Modern ML/CV pipeline** (the existing `lri_fuse_v2.py` work) — rebuild the multi-camera fusion using Apple Depth Pro, a PySide6 desktop app, and modern tools. Already produces results ~12× sharper than A1 alone at the canvas center. See "Working On Now" below.
+2. **Reverse-engineering Lumen's actual pipeline** (the `docs/reverse_engineering/` research) — static and dynamic analysis of the original `libcp.dylib` to understand exactly what Lumen does. Confirmed: Lumen runs Ceres Solver for per-capture bundle adjustment, uses Halide-compiled ISP kernels, and produces its refined state via `CIAPI::StateFileEditor::serialize`. The research informs the modern pipeline and will eventually let us match or exceed Lumen's output on captures the modern pipeline can't yet handle.
+
+---
+
+## Reverse-Engineering Documentation
+
+See `docs/reverse_engineering/` for the full RE notes:
+
+| Document | Topic |
+|---|---|
+| [00_INDEX.md](docs/reverse_engineering/00_INDEX.md) | Top-level index and current state |
+| [01_LRI_FORMAT.md](docs/reverse_engineering/01_LRI_FORMAT.md) | `.lri` file format (LELR blocks + LightHeader protobuf) |
+| [02_LRIS_FORMAT.md](docs/reverse_engineering/02_LRIS_FORMAT.md) | `.lris` sidecar format (Lumen's cache) |
+| [03_LUMEN_PIPELINE.md](docs/reverse_engineering/03_LUMEN_PIPELINE.md) | libcp rendering pipeline + stage ordering + Ceres structure |
+| [04_JNI_API.md](docs/reverse_engineering/04_JNI_API.md) | The 32-method JNI contract (our replacement's public API) |
+| [05_LIBCP_SYMBOLS.md](docs/reverse_engineering/05_LIBCP_SYMBOLS.md) | Key function addresses in libcp.dylib / libcp.so |
+| [06_OPEN_QUESTIONS.md](docs/reverse_engineering/06_OPEN_QUESTIONS.md) | What we don't know yet |
+| [07_CERES_VALUES.md](docs/reverse_engineering/07_CERES_VALUES.md) | Round 3 Ceres value-capture attempt (incomplete — shim injection hit an API surface mismatch) |
+| [08_CALIBRATION_ORCHESTRATOR.md](docs/reverse_engineering/08_CALIBRATION_ORCHESTRATOR.md) | Decompilation of the 3 Ceres::Solve call sites in libcp.dylib |
+| [09_LRI_FIELDS_16_23.md](docs/reverse_engineering/09_LRI_FIELDS_16_23.md) | Deep decode of LightHeader fields 16 (LUT) and 23 (proto2-group blob) |
+
+Key findings so far:
+- **libcp.so (Android arm64) and libcp.dylib (macOS x86_64) are bit-for-bit the same codebase** — identical `__text` section size (0x553ad0). One codebase, two platforms.
+- **Lumen runs real bundle adjustment** at render time via Ceres Solver. Observed dynamically: 3 Ceres::Problem instances, 183 scalar parameter blocks, 347 residuals, 18 distinct cost-function types, CauchyLoss for robustness.
+- **The 3 Ceres passes are sequential** in 3 separate internal functions of `lt::RendererPrivate`, called in a fixed order: geometric calibration → depth refinement → global bundle adjustment. Decompiled in [08_CALIBRATION_ORCHESTRATOR.md](docs/reverse_engineering/08_CALIBRATION_ORCHESTRATOR.md).
+- **MOVABLE B camera pose math was wrong** in the original `lri_calibration.py`. Fixed 2026-04-09 using the empirically-validated V1 formula: virtual forward = `rodrigues((0,0,1), rotation_axis, mirror_angle_deg)`. Each MOVABLE B now lands at ~37° off-axis pointing at a distinct A-FOV corner, matching the Light L16 IEEE Spectrum article's description of the 28mm-mode layout.
+- **The on-device camera app does NOT write LRIS sidecars** — LRIS is written only by desktop Lumen (via `CIAPI::StateFileEditor::serialize`). The `light_gallery.apk` Android app contains the same `libcp.so` as the desktop, but only writes `.state` files with user edits.
 
 ---
 
@@ -183,10 +214,11 @@ Double-click any LRI in the browser panel to start processing. The pipeline cach
 LRI files are sequences of `LELR`-magic blocks. Each block contains a protobuf-encoded header with camera module descriptors. Image data is `PACKED_10BPP` Bayer (4 pixels in 5 bytes, little-endian bit order).
 
 Camera IDs map to positions:
-- `A1–A5`: wide-angle modules (~35mm equivalent)
-- `B1–B5`: telephoto modules (~70–150mm)
+- `A1–A5`: 28mm equivalent wide-angle modules, direct-fire (no mirror)
+- `B1–B5`: 70mm equivalent telephoto modules, periscope optics with mirror (B4 is the GLUED center; B1/B2/B3/B5 are MOVABLE and aim at the four quadrants of the A-camera FOV in 28mm mode)
+- `C1–C6`: 150mm equivalent telephoto modules, periscope optics with mirror
 
-See `lri_extract.py` and `lri_calibration.py` for the full parsing logic.
+See `lri_extract.py` and `lri_calibration.py` for the full parsing logic. See [docs/reverse_engineering/01_LRI_FORMAT.md](docs/reverse_engineering/01_LRI_FORMAT.md) for the complete LRI format specification including all LightHeader protobuf fields, the MOVABLE mirror pose math, and per-camera calibration data layout.
 
 ---
 
