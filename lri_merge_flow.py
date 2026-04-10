@@ -28,6 +28,19 @@ from lri_camera_remap import compute_remap, apply_remap
 from lri_confidence import compute_confidence
 from lri_merge import GroupVirtualCamera, _apply_factory_isp, linear_to_srgb_uint8
 
+# Per-camera horizontal calibration corrections (dx, dy) in pixels.
+# Derived empirically from Ceres triangulation across 5 captures
+# (docs/reverse_engineering/22_CERES_CORRECTION_MAP.md).
+# Horizontal component is systematic (ratio 0.70–0.92); vertical is
+# scene-dependent and therefore NOT baked in (stays at 0.0).
+DEFAULT_A_CAMERA_CORRECTIONS: dict[str, tuple[float, float]] = {
+    'A1': (-0.88, 0.0),
+    'A2': (-1.05, 0.0),
+    'A3': ( 0.00, 0.0),   # centre camera, no systematic offset
+    'A4': (+1.14, 0.0),
+    'A5': (+2.11, 0.0),   # largest drift — confirmed systematic
+}
+
 
 def _warp_by_flow(img: np.ndarray, flow: np.ndarray) -> np.ndarray:
     """
@@ -81,6 +94,7 @@ def merge_cameras_with_flow(
     n_iterations: int = 2,
     target_effective_exposure: float | None = None,
     camera_weights: dict[str, float] | None = None,
+    camera_corrections: 'dict[str, tuple[float, float]] | None' = DEFAULT_A_CAMERA_CORRECTIONS,
     coarse_scale: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
@@ -163,6 +177,10 @@ def merge_cameras_with_flow(
                                   awb_mode=awb_mode)
 
         map_x, map_y, mask = compute_remap(virtual_cam, cam, depth_map)
+        if camera_corrections and cam_name in camera_corrections:
+            dx, dy = camera_corrections[cam_name]
+            map_x = map_x + dx
+            map_y = map_y + dy
         warped = apply_remap(img, map_x, map_y, interpolation=cv2.INTER_LINEAR)
         conf = compute_confidence(img, cam, virtual_cam, mask, map_x, map_y)
 
