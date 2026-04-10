@@ -50,11 +50,17 @@ FORMAT_PACKED_10BPP = 7
 FORMAT_PACKED_12BPP = 8
 FORMAT_PACKED_14BPP = 9
 
+# Maps bayer_pattern value (from lri_calibration.py: (bx%2)|((by%2)<<1)
+# where bx,by = position of the R pixel) to (row, col) of the R pixel.
+# bayer_pattern = 0 → bx=0,by=0 → R at row 0, col 0 (RGGB)
+# bayer_pattern = 1 → bx=1,by=0 → R at row 0, col 1 (GRBG)
+# bayer_pattern = 2 → bx=0,by=1 → R at row 1, col 0 (GBRG)
+# bayer_pattern = 3 → bx=1,by=1 → R at row 1, col 1 (BGGR)
 _RGGB_R_POS = {
     0: (0, 0),  # RGGB
     1: (0, 1),  # GRBG
-    2: (1, 1),  # BGGR
-    3: (1, 0),  # GBRG
+    2: (1, 0),  # GBRG  ← was (1,1)/BGGR — patterns 2 and 3 were swapped
+    3: (1, 1),  # BGGR  ← was (1,0)/GBRG
 }
 
 
